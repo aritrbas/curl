@@ -134,6 +134,7 @@ LIB_CFILES =         \
   bufref.c           \
   cf-h1-proxy.c      \
   cf-h2-proxy.c      \
+  cf-h3-proxy.c      \
   cf-haproxy.c       \
   cf-https-connect.c \
   cf-socket.c        \
@@ -267,6 +268,7 @@ LIB_HFILES =         \
   bufref.h           \
   cf-h1-proxy.h      \
   cf-h2-proxy.h      \
+  cf-h3-proxy.h      \
   cf-haproxy.h       \
   cf-https-connect.h \
   cf-socket.h        \

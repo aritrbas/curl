@@ -2456,6 +2456,8 @@ static CURLcode cf_connect_start(struct Curl_cfilter *cf,
                                  struct pkt_io_ctx *pktx)
 {
   struct cf_ngtcp2_ctx *ctx = cf->ctx;
+  struct ossl_ctx *ossl = &ctx->tls.ossl.ssl;
+  BIO *bio;
   int rc;
   int rv;
   CURLcode result;
@@ -2484,20 +2486,22 @@ static const struct alpn_spec ALPN_SPEC_H3 = {
   if(result)
     return result;
 
-  Curl_cf_socket_peek(cf->next, data, &ctx->q.sockfd, &sockaddr, NULL);
-  if(!sockaddr)
-    return CURLE_QUIC_CONNECT_ERROR;
-  ctx->q.local_addrlen = sizeof(ctx->q.local_addr);
-  rv = getsockname(ctx->q.sockfd, (struct sockaddr *)&ctx->q.local_addr,
-                   &ctx->q.local_addrlen);
-  if(rv == -1)
-    return CURLE_QUIC_CONNECT_ERROR;
+  if(cf->next->cft == &Curl_cft_udp) {
+    Curl_cf_socket_peek(cf->next, data, &ctx->q.sockfd, &sockaddr, NULL);
+    if(!sockaddr)
+      return CURLE_QUIC_CONNECT_ERROR;
+    ctx->q.local_addrlen = sizeof(ctx->q.local_addr);
+    rv = getsockname(ctx->q.sockfd, (struct sockaddr *)&ctx->q.local_addr,
+                    &ctx->q.local_addrlen);
+    if(rv == -1)
+      return CURLE_QUIC_CONNECT_ERROR;
 
-  ngtcp2_addr_init(&ctx->connected_path.local,
-                   (struct sockaddr *)&ctx->q.local_addr,
-                   ctx->q.local_addrlen);
-  ngtcp2_addr_init(&ctx->connected_path.remote,
-                   &sockaddr->curl_sa_addr, (socklen_t)sockaddr->addrlen);
+    ngtcp2_addr_init(&ctx->connected_path.local,
+                    (struct sockaddr *)&ctx->q.local_addr,
+                    ctx->q.local_addrlen);
+    ngtcp2_addr_init(&ctx->connected_path.remote,
+                    &sockaddr->curl_sa_addr, (socklen_t)sockaddr->addrlen);
+  }
 
   rc = ngtcp2_conn_client_new(&ctx->qconn, &ctx->dcid, &ctx->scid,
                               &ctx->connected_path,
@@ -2558,11 +2562,13 @@ static CURLcode cf_ngtcp2_connect(struct Curl_cfilter *cf,
     return CURLE_OK;
   }
 
-  /* Connect the UDP filter first */
-  if(!cf->next->connected) {
-    result = Curl_conn_cf_connect(cf->next, data, done);
-    if(result || !*done)
-      return result;
+  if(cf->next->cft == &Curl_cft_udp) {
+    /* Connect the UDP filter first */
+    if(!cf->next->connected) {
+      result = Curl_conn_cf_connect(cf->next, data, done);
+      if(result || !*done)
+        return result;
+    }
   }
 
   *done = FALSE;
@@ -2795,6 +2801,34 @@ out:
   if(result) {
     if(udp_cf)
       Curl_conn_cf_discard_sub(cf, udp_cf, data, TRUE);
+    Curl_safefree(cf);
+    cf_ngtcp2_ctx_free(ctx);
+  }
+  return result;
+}
+
+CURLcode Curl_cf_ngtcp2_insert_after(struct Curl_cfilter *cf_at,
+  struct Curl_easy *data, struct Curl_dns_entry *remotehost)
+{
+  struct cf_ngtcp2_ctx *ctx = NULL;
+  struct Curl_cfilter *cf = NULL;
+  CURLcode result;
+
+  (void)data;
+  ctx = calloc(1, sizeof(*ctx));
+  if(!ctx) {
+    result = CURLE_OUT_OF_MEMORY;
+    goto out;
+  }
+  cf_ngtcp2_ctx_init(ctx);
+
+  result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
+  if(result)
+    goto out;
+    Curl_conn_cf_insert_after(cf_at, cf);
+    cf->conn = cf_at->conn;
+out:
+  if(result) {
     Curl_safefree(cf);
     cf_ngtcp2_ctx_free(ctx);
   }
