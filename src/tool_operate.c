@@ -968,6 +968,10 @@ static CURLcode config2setopts(struct GlobalConfig *global,
   /* new in libcurl 7.3 */
   my_setopt_long(curl, CURLOPT_HTTPPROXYTUNNEL, config->proxytunnel);
 
+  /* new in libcurl 8.12 */
+  my_setopt(curl, CURLOPT_HTTPPROXYUDPTUNNEL, config->proxyudptunnel ?
+            1L : 0L);
+
   /* new in libcurl 7.52.0 */
   if(config->preproxy)
     my_setopt_str(curl, CURLOPT_PRE_PROXY, config->preproxy);

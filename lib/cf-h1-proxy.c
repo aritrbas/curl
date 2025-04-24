@@ -26,6 +26,7 @@
 
 #if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP)
 
+#include <openssl/bio.h>
 #include <curl/curl.h>
 #include "urldata.h"
 #include "dynbuf.h"
@@ -165,7 +166,12 @@ static void h1_tunnel_go_state(struct Curl_cfilter *cf,
 
   case H1_TUNNEL_ESTABLISHED:
     CURL_TRC_CF(data, cf, "new tunnel state 'established'");
-    infof(data, "CONNECT phase completed");
+    if(cf->conn->bits.udp_tunnel_proxy) {
+      infof(data, "CONNECT-UDP phase completed");
+    }
+    else {
+      infof(data, "CONNECT phase completed");
+    }
     data->state.authproxy.done = TRUE;
     data->state.authproxy.multipass = FALSE;
     FALLTHROUGH();
@@ -220,11 +226,21 @@ static CURLcode start_CONNECT(struct Curl_cfilter *cf,
        then. Just free() it. */
   Curl_safefree(data->req.newurl);
 
-  result = Curl_http_proxy_create_CONNECT(&req, cf, data, 1);
+  if(cf->conn->bits.udp_tunnel_proxy) {
+    result = Curl_http_proxy_create_CONNECTUDP(&req, cf, data, 1);
+  }
+  else {
+    result = Curl_http_proxy_create_CONNECT(&req, cf, data, 1);
+  }
   if(result)
     goto out;
 
-  infof(data, "Establish HTTP proxy tunnel to %s", req->authority);
+  if(cf->conn->bits.udp_tunnel_proxy) {
+    infof(data, "Establish HTTP UDP proxy tunnel to %s", req->authority);
+  }
+  else {
+    infof(data, "Establish HTTP proxy tunnel to %s", req->authority);
+  }
 
   Curl_dyn_reset(&ts->request_data);
   ts->nsent = 0;
@@ -276,6 +292,48 @@ out:
   if(result)
     failf(data, "Failed sending CONNECT to proxy");
   *done = (!result && (ts->nsent >= request_len));
+  return result;
+}
+
+static CURLcode on_resp_header_udp(struct Curl_easy *data,
+                                   struct h1_tunnel_state *ts,
+                                   const char *header)
+{
+  CURLcode result = CURLE_OK;
+  struct SingleRequest *k = &data->req;
+
+  if(checkprefix("Transfer-Encoding:", header)) {
+    if(Curl_compareheader(header,
+                           STRCONST("Transfer-Encoding:"),
+                           STRCONST("chunked"))) {
+      infof(data, "ABASU TEST CONNECT-UDP Response Transfer-Encoding");
+      ts->chunked_encoding = TRUE;
+      /* reset our chunky engine */
+      Curl_httpchunk_reset(data, &ts->ch, TRUE);
+    }
+  }
+  else if(checkprefix("Capsule-protocol:", header)) {
+    if(Curl_compareheader(header,
+                           STRCONST("Capsule-protocol:"),
+                           STRCONST("?1"))) {
+      infof(data, "ABASU TEST CONNECT-UDP Response Capsule-protocol");
+    }
+  }
+  else if(Curl_compareheader(header,
+                              STRCONST("Connection:"), STRCONST("close"))) {
+    ts->close_connection = TRUE;
+    infof(data, "ABASU TEST CONNECT-UDP Response Connection: close");
+  }
+  else if(!strncmp(header, "HTTP/1.", 7) &&
+           ((header[7] == '0') || (header[7] == '1')) &&
+           (header[8] == ' ') &&
+           ISDIGIT(header[9]) && ISDIGIT(header[10]) && ISDIGIT(header[11]) &&
+           !ISDIGIT(header[12])) {
+    /* store the HTTP code from the proxy */
+    data->info.httpproxycode = k->httpcode = (header[9] - '0') * 100 +
+                          (header[10] - '0') * 10 + (header[11] - '0');
+    infof(data, "ABASU TEST CONNECT-UDP Response 200 OK");
+  }
   return result;
 }
 
@@ -508,7 +566,12 @@ static CURLcode recv_CONNECT_resp(struct Curl_cfilter *cf,
       continue;
     }
 
-    result = on_resp_header(cf, data, ts, linep);
+    if(cf->conn->bits.udp_tunnel_proxy) {
+      result = on_resp_header_udp(data, ts, linep);
+    }
+    else {
+      result = on_resp_header(cf, data, ts, linep);
+    }
     if(result)
       return result;
 
@@ -629,8 +692,14 @@ static CURLcode H1_CONNECT(struct Curl_cfilter *cf,
   }
   /* 2xx response, SUCCESS! */
   h1_tunnel_go_state(cf, ts, H1_TUNNEL_ESTABLISHED, data);
+  if(cf->conn->bits.udp_tunnel_proxy) {
+    infof(data, "CONNECT-UDP tunnel established, response %d",
+                data->info.httpproxycode);
+  }
+  else {
   infof(data, "CONNECT tunnel established, response %d",
         data->info.httpproxycode);
+  }
   result = CURLE_OK;
 
 out:
@@ -732,6 +801,536 @@ static void cf_h1_proxy_close(struct Curl_cfilter *cf,
   }
 }
 
+#define HTTP_INVALID_VARINT             ((uint64_t) ~0)
+#define HTTP_CAPSULE_HEADER_MAX_SIZE    10
+
+#define foreach_http_capsule_type _ (0, DATAGRAM)
+typedef enum http_capsule_type_
+{
+#define _(n, s) HTTP_CAPSULE_TYPE_##s = n,
+  foreach_http_capsule_type
+#undef _
+} __attribute__((packed)) http_capsule_type_t;
+
+static uint64_t
+custom_ntohll(uint64_t value)
+{
+  union {
+      uint64_t u64;
+      uint32_t u32[2];
+  } src, dst;
+
+  src.u64 = value;
+
+  dst.u32[0] = ntohl(src.u32[1]);
+  dst.u32[1] = ntohl(src.u32[0]);
+
+  return dst.u64;
+}
+
+static void
+http_encode_varint(struct dynbuf *dyn, uint64_t value)
+{
+  DEBUGASSERT(value <= 0x3FFFFFFFFFFFFFFF);
+
+  if(value <= 0x3F) {
+    uint8_t encoded;
+    encoded = (char)value;
+    Curl_dyn_addn(dyn, &encoded, sizeof(encoded));
+  }
+  else if(value <= 0x3FFF) {
+    /* Set bits 15-14 to "01", preserve lower 14 bits */
+    uint16_t encoded;
+    encoded = (uint16_t)value & 0x3FFF;
+    encoded = ntohs(encoded | 0x4000);
+    Curl_dyn_addn(dyn, &encoded, sizeof(encoded));
+  }
+  else if(value <= 0x3FFFFFFF) {
+    /* Set bits 31-30 to "10", preserve lower 30 bits */
+    uint32_t encoded;
+    encoded = (uint32_t)value & 0x3FFFFFFF;
+    encoded = ntohl(encoded | 0x80000000);
+    Curl_dyn_addn(dyn, &encoded, sizeof(encoded));
+  }
+  else {
+    /* Set bits 63-62 to "11", preserve lower 62 bits */
+    uint64_t encoded;
+    encoded = (uint64_t)value & 0x3FFFFFFFFFFFFFFF;
+    encoded = custom_ntohll(encoded | 0xC000000000000000);
+    Curl_dyn_addn(dyn, &encoded, sizeof(encoded));
+  }
+}
+
+static CURLcode
+encap_udp_payload_datagram(struct dynbuf *dyn,
+                           char **buf, size_t *blen)
+{
+  CURLcode result = CURLE_OK;
+  uint8_t cap_type = 0; /* HTTP Datagram */
+  uint8_t ctx_id = 0; /* Context ID for UDP Proxying Payload */
+
+  Curl_dyn_init(dyn, HTTP_CAPSULE_HEADER_MAX_SIZE + *blen);
+
+  Curl_dyn_addn(dyn, &cap_type, sizeof(cap_type));
+
+  http_encode_varint(dyn, *blen + 1);
+
+  Curl_dyn_addn(dyn, &ctx_id, sizeof(ctx_id));
+
+  Curl_dyn_addn(dyn, buf, *blen);
+
+  *buf = dyn->bufr;
+  *blen = dyn->leng;
+
+  return result;
+}
+
+static ssize_t
+cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
+                 const void *buf, size_t len, bool eos, CURLcode *err)
+{
+  int rv;
+  if(!cf->next)
+    CURLE_SEND_ERROR;
+
+  if(data->conn->bits.udp_tunnel_proxy) {
+    struct dynbuf dyn;
+    /* MASQUE FIX : WHY IS THIS FAILING? :( */
+    /* encap_udp_payload_datagram(&dyn, &buf, &len); */
+
+    uint8_t cap_type = 0;
+    uint8_t ctx_id = 0;
+
+    Curl_dyn_init(&dyn, HTTP_CAPSULE_HEADER_MAX_SIZE + len);
+
+    Curl_dyn_addn(&dyn, &cap_type, sizeof(cap_type));
+
+    http_encode_varint(&dyn, len + 1);
+
+    Curl_dyn_addn(&dyn, &ctx_id, sizeof(ctx_id));
+
+    Curl_dyn_addn(&dyn, buf, len);
+
+    rv = cf->next->cft->do_send(cf->next, data, dyn.bufr, dyn.leng, eos, err);
+  }
+  else {
+    rv = cf->next->cft->do_send(cf->next, data, buf, len, eos, err);
+  }
+
+  return rv;
+}
+
+static uint8_t
+http_var_length_bytes(char *start)
+{
+  uint8_t first_byte = *start;
+
+  /* Check the first 2 bits */
+  if((first_byte & 0xC0) == 0x00) /* 00xxxxxx */
+    return 1;
+  else if((first_byte & 0xC0) == 0x40) /* 01xxxxxx */
+    return 2;
+  else if((first_byte & 0xC0) == 0x80) /* 10xxxxxx */
+    return 4;
+  else /* 11xxxxxx */
+    return 8;
+}
+
+static uint64_t
+http_decode_varint(char **start)
+{
+  uint8_t first_byte;
+  uint8_t bytes_left;
+  uint64_t value;
+  char *pos;
+
+  pos = *start;
+  first_byte = *pos;
+  pos++;
+
+  if(first_byte <= 0x3F) {
+    *start = pos;
+    return first_byte;
+  }
+
+  /* remove length bits, encoded in the first two bits of the first byte */
+  value = first_byte & 0x3F;
+  bytes_left = (1 << (first_byte >> 6)) - 1;
+
+  do
+  {
+    value = (value << 8) | (uint8_t)(*pos);
+    pos++;
+  }
+  while(--bytes_left);
+
+  *start = pos;
+  return value;
+}
+
+#define TMP_BUF_SIZE (size_t) 131072
+static uint64_t head = 0;
+static uint64_t tail = 0;
+static char tmp_buf[TMP_BUF_SIZE] = {0};
+/* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
+static uint64_t written = 0;
+static uint64_t received = 0;
+
+# define BIO_MSG_N(array, stride, n) \
+  (*(BIO_MSG *)((char *)(array) + (n)*(stride)))
+
+/* Add data to the circular queue, handling wrapping if needed */
+static CURLcode
+add_to_circular_queue(struct Curl_easy *data,
+                      char *buf, size_t stride, uint8_t idx)
+{
+  BIO_MSG *my_bio = (BIO_MSG *)buf;
+  char *stream_data;
+  size_t stream_data_len;
+  size_t remaining_space;
+  size_t bytes_to_copy;
+
+  /* Calculate remaining space in tmp_buf */
+  remaining_space = (head <= tail) ?
+                    (TMP_BUF_SIZE - tail + head) :
+                    (head - tail);
+
+  stream_data = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
+  stream_data_len = (size_t)(BIO_MSG_N(my_bio, stride, idx).data_len);
+  /* infof(data, "ABASU TEST %lld stream data len received",
+              stream_data_len); */
+
+  if(stream_data_len > remaining_space) {
+    /* Ideally we should not be hitting this case */
+    infof(data, "Buffer overflow - not enough space in circular buffer");
+    abort();
+    return CURLE_TOO_LARGE;
+  }
+
+  /* Copy data into circular queue */
+  if(tail + stream_data_len < TMP_BUF_SIZE) {
+    /* Continuous copy */
+    memcpy(tmp_buf + tail, stream_data, stream_data_len);
+    tail += stream_data_len;
+    if(tail == TMP_BUF_SIZE)
+      tail = 0;
+  }
+  else {
+    /* Split copy into circular queue */
+    bytes_to_copy = TMP_BUF_SIZE - tail;
+    memcpy(tmp_buf + tail, stream_data, bytes_to_copy);
+    memcpy(tmp_buf, stream_data + bytes_to_copy,
+            stream_data_len - bytes_to_copy);
+    tail = stream_data_len - bytes_to_copy;
+  }
+  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
+  received += stream_data_len;
+
+  return CURLE_OK;
+}
+
+/* | <empty> | <data> | <empty> */
+/*         head      tail       */
+/* ..............OR............ */
+/* | <data> | <empty> | <data>  */
+/*         tail      head       */
+
+static CURLcode
+process_chunked_capsules(struct Curl_easy *data,
+                         char *buf, size_t stride, size_t idx)
+{
+  char *chunk_start;
+  char *capsule_start;
+  char *pos;
+  size_t tot_avail_bytes;
+  size_t unwrapped_bytes;
+  char chunk_size[4] = {0};
+  uint8_t chunk_len_bytes;
+  curl_off_t chunk_len;
+  size_t var_enc_bytes;
+  uint64_t capsule_length;
+  uint64_t output_len = 0;
+  uint64_t offset;
+  size_t bytes_to_copy;
+
+  BIO_MSG *my_bio = (BIO_MSG*)buf;
+  char *dgram = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
+
+  /* Process capsules from circular buffer */
+  /* Calculate available data */
+  tot_avail_bytes = (tail >= head) ?
+                    (tail - head) :
+                    (TMP_BUF_SIZE - head + tail);
+
+  /* Need minimum 8 bytes */
+  if(tot_avail_bytes < 8)
+    return CURLE_RECV_ERROR;
+
+  unwrapped_bytes = (head < tail) ?
+                    (tail - head) :
+                    (TMP_BUF_SIZE - head);
+
+  chunk_start = tmp_buf + head;
+  /* Find the first \r\n */
+  char *first_crlf = strstr(chunk_start, "\r\n");
+  if(!first_crlf) {
+    infof(data, "Cannot find chunk start");
+    return CURLE_RECV_ERROR;
+  }
+
+  /* Extract the chunk len from the buf (stored in ASCII as hex) */
+  chunk_len_bytes = first_crlf - chunk_start;
+  if(chunk_len_bytes >= sizeof(chunk_size)) {
+    infof(data, "Chunk len exceeds max expected size of 65535");
+    return CURLE_RECV_ERROR;
+  }
+  memcpy(chunk_size, chunk_start, chunk_len_bytes);
+
+  /* Convert the hex string to int */
+  Curl_str_number(&chunk_size, &chunk_len, 0xFFFF);
+  if(chunk_len == 0) {
+    infof(data, "Invalid chunk length");
+    return CURLE_RECV_ERROR;
+  }
+
+  /* Point to start of data after first \r\n */
+  capsule_start = first_crlf + 2;
+  unwrapped_bytes = unwrapped_bytes - chunk_len_bytes - 2;
+  tot_avail_bytes = tot_avail_bytes - chunk_len_bytes - 2;
+
+  /* Verify capsule starts with 0x00 */
+  if(capsule_start[0] != 0x00) {
+    infof(data, "Invalid capsule start byte: %02x", capsule_start[0]);
+    return CURLE_RECV_ERROR;
+  }
+  capsule_start++;
+  unwrapped_bytes--;
+  tot_avail_bytes--;
+
+  pos = capsule_start;
+  var_enc_bytes = http_var_length_bytes(pos);
+  /* Cannot process capsule length since we do not have enough bytes */
+  if(var_enc_bytes > tot_avail_bytes)
+    return CURLE_RECV_ERROR;
+
+  if(var_enc_bytes + 1 > unwrapped_bytes) {
+    /* Need to handle wrapped length value */
+    char temp[8];
+    size_t first = unwrapped_bytes;
+    size_t second = var_enc_bytes - unwrapped_bytes;
+
+    memcpy(temp, pos, first);
+    memcpy(temp + first, tmp_buf, second);
+    pos = tmp_buf + second;
+    char *decode = &temp[0];
+    capsule_length = http_decode_varint(&decode);
+    capsule_start = pos;
+    unwrapped_bytes = tail - second;
+    tot_avail_bytes -= var_enc_bytes;
+  }
+  else {
+    capsule_length = http_decode_varint(&pos);
+    capsule_start = pos;
+    unwrapped_bytes -= var_enc_bytes;
+    tot_avail_bytes -= var_enc_bytes;
+  }
+
+  /* Verify context ID is 0x00 */
+  if(capsule_start[0] != 0x00) {
+    infof(data, "Invalid context ID: %02x", capsule_start[0]);
+    return CURLE_RECV_ERROR;
+  }
+  capsule_start++;
+  unwrapped_bytes--;
+  tot_avail_bytes--;
+  capsule_length--; /* Account for the context ID byte */
+
+  /* Cannot process capsule because we do not have enough bytes */
+  if(capsule_length > tot_avail_bytes + 2)
+    return CURLE_RECV_ERROR;;
+
+  offset = chunk_len_bytes + 2 + var_enc_bytes + 2;
+  /* Check if the chunked data actually ends with /r/n */
+  if(head + offset + capsule_length <= TMP_BUF_SIZE) {
+    if(capsule_start[capsule_length] != '\r'
+          || capsule_start[capsule_length + 1] != '\n') {
+      infof(data, "Cannot find chunk end 1");
+      return CURLE_RECV_ERROR;
+    }
+  }
+  else {
+    bytes_to_copy = TMP_BUF_SIZE - (head + offset);
+    if(tmp_buf[capsule_length - bytes_to_copy] != '\r'
+          || tmp_buf[capsule_length - bytes_to_copy + 1] != '\n') {
+      infof(data, "Cannot find chunk end 2");
+      return CURLE_RECV_ERROR;
+    }
+  }
+
+  /* Copy payload, handling wrap if needed */
+  if(head + offset + capsule_length <= TMP_BUF_SIZE) {
+    /* Continuous copy */
+    memcpy(dgram, capsule_start, capsule_length);
+  }
+  else {
+    /* Split circular copy */
+    bytes_to_copy = TMP_BUF_SIZE - (head + offset);
+    memcpy(dgram, capsule_start, bytes_to_copy);
+    memcpy(dgram + bytes_to_copy, tmp_buf,
+            capsule_length - bytes_to_copy);
+  }
+
+  BIO_MSG_N(my_bio, stride, idx).data_len = capsule_length;
+  /* infof(data, "ABASU TEST %lld dgram filled",
+    capsule_length); */
+  /* Update head */
+  head += (offset + capsule_length + 2);
+  if(head >= TMP_BUF_SIZE)
+    head -= TMP_BUF_SIZE;
+
+  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
+  written += (offset + capsule_length + 2);
+  return CURLE_OK;
+}
+
+static size_t
+decap_udp_payload_datagram2(struct Curl_easy *data,
+                            char *buf, uint8_t count,
+                            size_t stride)
+{
+  size_t idx;
+  size_t last_cap = 0;
+  /* MASQUE FIX: how to get this value from OpenSSL code? */
+  size_t num_msg = 32;
+  CURLcode res;
+  infof(data, "ABASU TEST %d filled buf received", count);
+
+  for(idx = 0; idx < count; idx++) {
+    /* append data from all the filled buffers in BIO_MSG to tmp_buf */
+    res = add_to_circular_queue(data, buf, stride, idx);
+    if(res != CURLE_OK)
+      break;
+
+    /* process capsules from circular buffer */
+    res = process_chunked_capsules(data, buf, stride, idx);
+    if(res != CURLE_OK)
+      break;
+    last_cap = idx + 1;
+  }
+
+  /* process capsules from circular buffer */
+  for(; idx < num_msg; idx++) {
+    res = process_chunked_capsules(data, buf, stride, idx);
+    if(res != CURLE_OK)
+      break;
+    last_cap = idx + 1;
+  }
+
+  infof(data, "ABASU TEST %d filled dgram sent", idx);
+  if(head == tail) {
+    head = 0;
+    tail = 0;
+  }
+  if(tail < head)
+    infof(data, "ABASU TEST "
+      "head=%lld, tail=%lld, written=%lld, received=%lld",
+      head, tail, written, received);
+  return idx;
+}
+
+static int
+decap_udp_payload_datagram(struct Curl_easy *data,
+                           char *buf, int *len)
+{
+  /* When Transfer Encoding: Chunked, the following is the data
+     format on the wire : <xxx>\r\n<Capsule>\r\n */
+
+  /* Find the first \r\n */
+  char *first_crlf = strstr(buf, "\r\n");
+  if(!first_crlf)
+    abort();
+
+  /* Extract the chunk len from the buf (stored in ASCII as hex) */
+  char chunk_size[4] = {0};
+  uint8_t chunk_len_bytes = first_crlf - buf;
+  if(chunk_len_bytes >= sizeof(chunk_size))
+    abort();
+  memcpy(chunk_size, buf, chunk_len_bytes);
+
+  /* Convert the hex string to int */
+  curl_off_t chunk_len;
+  Curl_str_number(&chunk_size, &chunk_len, 0xFFFF);
+  if(chunk_len == 0)
+    abort();
+
+  /* Point to start of data after first \r\n */
+  char *capsule_start = first_crlf + 2;
+
+  /* RFC9297: Check if the first byte in the capsule is 0x00
+     Capsule Type: DATAGRAM (0x00) */
+  if(capsule_start[0] != 0x00)
+    abort();
+  capsule_start++;
+
+  uint64_t data_len = http_decode_varint(&capsule_start);
+
+  /* RFC9298: Check if the context ID is 0x00
+     Context ID: 0x00 (UDP Proxying Payload) */
+  if(capsule_start[0] != 0x00)
+    abort();
+  capsule_start++;
+  data_len--;
+
+  /* Check if the chunked data actually ends with /r/n */
+  if(capsule_start[data_len] != '\r' || capsule_start[data_len + 1] != '\n')
+    abort();
+
+  infof(data, "ABASU TESTING ............... "
+        "............... len=%d, chunk_len=%d, data_len=%d",
+        *len, chunk_len, data_len);
+
+  memcpy(buf, capsule_start, data_len);
+  *len = data_len;
+
+  return 0;
+}
+
+/* ABASU FIX: Read multiple capsules */
+static ssize_t
+cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
+                 char *buf, size_t len, CURLcode *err)
+{
+  int rv;
+  if(!cf->next)
+    CURLE_RECV_ERROR;
+
+  /*
+  if(data->conn->bits.udp_tunnel_proxy)
+    decap_udp_payload_datagram(data, buf, &rv);
+  */
+  if(data->conn->bits.udp_tunnel_proxy) {
+    BIO_MSG *my_bio = (BIO_MSG*)buf;
+    /* MASQUE FIX: how to get this value from OpenSSL code? */
+    size_t num_msg = 32;
+    size_t stride = len;
+    uint8_t idx = 0;
+    for(idx = 0; idx < num_msg; idx++) {
+      rv = cf->next->cft->do_recv(cf->next, data,
+                          (char *)(BIO_MSG_N(my_bio, stride, idx).data),
+                          (size_t)(BIO_MSG_N(my_bio, stride, idx).data_len),
+                          err);
+      if(rv < 0)
+        break;
+      BIO_MSG_N(my_bio, stride, idx).data_len = rv;
+    }
+    if(idx > 0)
+      rv = decap_udp_payload_datagram2(data, (char *)my_bio, idx, stride);
+  }
+  else {
+    rv = cf->next->cft->do_recv(cf->next, data, buf, len, err);
+  }
+  return rv;
+}
 
 struct Curl_cftype Curl_cft_h1_proxy = {
   "H1-PROXY",
@@ -744,8 +1343,8 @@ struct Curl_cftype Curl_cft_h1_proxy = {
   Curl_cf_http_proxy_get_host,
   cf_h1_proxy_adjust_pollset,
   Curl_cf_def_data_pending,
-  Curl_cf_def_send,
-  Curl_cf_def_recv,
+  cf_h1_proxy_send,
+  cf_h1_proxy_recv,
   Curl_cf_def_cntrl,
   Curl_cf_def_conn_is_alive,
   Curl_cf_def_conn_keep_alive,

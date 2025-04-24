@@ -259,6 +259,7 @@ static const struct LongShort aliases[]= {
   {"proxy-digest",               ARG_BOOL, ' ', C_PROXY_DIGEST},
   {"proxy-header",               ARG_STRG, ' ', C_PROXY_HEADER},
   {"proxy-http2",                ARG_BOOL, ' ', C_PROXY_HTTP2},
+  {"proxy-http3",                ARG_BOOL, ' ', C_PROXY_HTTP3},
   {"proxy-insecure",             ARG_BOOL, ' ', C_PROXY_INSECURE},
   {"proxy-key",                  ARG_FILE|ARG_TLS, ' ', C_PROXY_KEY},
   {"proxy-key-type",             ARG_STRG|ARG_TLS, ' ', C_PROXY_KEY_TYPE},
@@ -279,6 +280,7 @@ static const struct LongShort aliases[]= {
   {"proxy-user",                 ARG_STRG, 'U', C_PROXY_USER},
   {"proxy1.0",                   ARG_STRG, ' ', C_PROXY1_0},
   {"proxytunnel",                ARG_BOOL, 'p', C_PROXYTUNNEL},
+  {"proxyudptunnel",             ARG_BOOL, ' ', C_PROXYUDPTUNNEL},
   {"pubkey",                     ARG_STRG, ' ', C_PUBKEY},
   {"quote",                      ARG_STRG, 'Q', C_QUOTE},
   {"random-file",                ARG_FILE, ' ', C_RANDOM_FILE},
@@ -2369,6 +2371,12 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
       else
         config->proxyver = CURLPROXY_HTTPS2;
       break;
+    case C_PROXY_HTTP3: /* --proxy-http3 */
+      if(!feature_httpsproxy || !feature_http3)
+        err = PARAM_LIBCURL_DOESNT_SUPPORT;
+      else
+        config->proxyver = CURLPROXY_HTTPS3;
+      break;
     case C_TLSV1: /* --tlsv1 */
       config->ssl_version = CURL_SSLVERSION_TLSv1;
       break;
@@ -2866,7 +2874,10 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
       /* proxy tunnel for non-http protocols */
       config->proxytunnel = toggle;
       break;
-
+    case C_PROXYUDPTUNNEL: /* --proxyudptunnel */
+      /* UDP proxy tunnel for non-http protocols */
+      config->proxyudptunnel = toggle;
+      break;
     case C_DISABLE: /* --disable */
       /* if used first, already taken care of, we do it like this so we do not
          cause an error! */
@@ -2923,7 +2934,8 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
     case C_PROXY: /* --proxy */
       /* --proxy */
       err = getstr(&config->proxy, nextarg, ALLOW_BLANK);
-      if(config->proxyver != CURLPROXY_HTTPS2)
+      if(config->proxyver != CURLPROXY_HTTPS2 &&
+         config->proxyver != CURLPROXY_HTTPS3)
         config->proxyver = CURLPROXY_HTTP;
       break;
     case C_REQUEST: /* --request */

@@ -76,6 +76,7 @@
 #include "inet_ntop.h"
 #include "inet_pton.h"
 #include "progress.h"
+#include "http_proxy.h"
 #include "warnless.h"
 #include "conncache.h"
 #include "multihandle.h"
