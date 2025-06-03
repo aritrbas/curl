@@ -2686,7 +2686,9 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
 
   switch(conn->alpn) {
   case CURL_HTTP_VERSION_3:
-    DEBUGASSERT(Curl_conn_http_version(data, conn) == 30);
+    DEBUGASSERT((conn->bits.proxy || conn->bits.tunnel_proxy
+                  || conn->bits.udp_tunnel_proxy)
+                 || Curl_conn_http_version(data, conn) == 30);
     break;
   case CURL_HTTP_VERSION_2:
 #ifndef CURL_DISABLE_PROXY
