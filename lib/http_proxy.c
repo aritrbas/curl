@@ -422,7 +422,7 @@ CURLcode Curl_http_proxy_create_CONNECTUDP(struct httpreq **preq,
     if(result)
       goto out;
 
-    if(http_version_major == 2) {
+    if(http_version_major >= 2) {
       result = Curl_dynhds_cadd(&req->headers, "Capsule-Protocol", "?1");
       if(result)
         goto out;
