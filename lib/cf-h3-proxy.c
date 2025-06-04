@@ -886,9 +886,9 @@ static int handle_buffered_data(struct cf_osslq_stream *s,
   Curl_bufq_peek(&s->recvbuf, &buf, &buflen);
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
   /* MASQUE FIX: Remove this later */
-  infof(data, "[handle_buffered_data.......] "
+  /* infof(data, "[handle_buffered_data.......] "
               "stream ID %zd, buflen=%zu, nwritten = %zd",
-        s->id, buflen, nwritten);
+        s->id, buflen, nwritten); */
 
   if(nwritten < 0) {
     stream->tun_data_buffered = (curl_off_t)(buflen);
@@ -926,17 +926,17 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   }
 
   /* MASQUE FIX: Remove this later */
-  infof(data, "[cb_h3_recv_data.......] "
-    "stream ID %zd, buflen %zu", stream->s.id, buflen);
+  /*   infof(data, "[cb_h3_recv_data.......] "
+      "stream ID %zd, buflen %zu", stream->s.id, buflen); */
 
   stream->tun_data_recvd += (curl_off_t)buflen;
   CURL_TRC_CF(data, cf, "[cb_h3_recv_data] "
               "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
               stream->s.id, buflen, stream->tun_data_recvd);
   /* MASQUE FIX: Remove this later */
-  infof(data, "[cb_h3_recv_data] "
-              "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
-              stream->s.id, buflen, stream->tun_data_recvd);
+  /*   infof(data, "[cb_h3_recv_data] "
+                "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
+                stream->s.id, buflen, stream->tun_data_recvd); */
 
   if(proxy_ctx->partial_read) {
     stream->split_data = TRUE;
@@ -948,14 +948,14 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
   if(nwritten < 0) {
     /* MASQUE FIX: Remove this later */
-    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
+    /* infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten); */
     proxy_ctx->partial_read = TRUE;
     stream->tun_data_buffered = (curl_off_t)(buflen);
     return 0;
   }
   else if(nwritten < buflen) {
     /* MASQUE FIX: Remove this later */
-    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
+    /* infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten); */
     proxy_ctx->partial_read = TRUE;
     stream->tun_data_buffered = (curl_off_t)(buflen - nwritten);
     return 0;
@@ -1390,8 +1390,8 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         }
         else {
           /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Stream %ld read %ld bytes",
-            s->id, nread);
+          /* infof(data, "[cf_osslq_stream_recv] Stream %ld read %ld bytes",
+               s->id, nread); */
         }
       }
     }
@@ -1448,51 +1448,54 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
                       "bytes, DATA bytes = %zu, forwarded to nghttp3 = %zd",
                       s->id, s->id, blen, (blen - nread), nread);
         /* MASQUE FIX: Remove this later */
-        infof(data, "[cf_osslq_stream_recv] stream %ld, received %d bytes, "
-                    "DATA bytes = %zu, forwarded to nghttp3 = %zd",
-                    s->id, blen, (blen - nread), nread);
+         /* infof(data, "[cf_osslq_stream_recv] stream %ld, received %d
+             bytes, " "DATA bytes = %zu, forwarded to nghttp3 = %zd", s->id,
+             blen, (blen - nread), nread); */
 
-        if(proxy_ctx->partial_read) {
-          /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] buffer read pending %zd bytes",
-                        stream->tun_data_buffered);
+         if(proxy_ctx->partial_read) {
+           /* MASQUE FIX: Remove this later */
+           /* infof(data, "[cf_osslq_stream_recv] buffer read
+              pending %zd bytes", stream->tun_data_buffered); */
 
-          if(stream->split_data) {
-            int len = Curl_bufq_len(&s->recvbuf);
-            char *temp = malloc(len);
+           if(stream->split_data) {
+             int len = Curl_bufq_len(&s->recvbuf);
+             char *temp = malloc(len);
 
-            Curl_bufq_read(&s->recvbuf, (unsigned char *)temp, len, &result);
-            Curl_bufq_reset(&s->recvbuf);
+             Curl_bufq_read(&s->recvbuf, (unsigned char *)temp, len,
+                             &result);
+             Curl_bufq_reset(&s->recvbuf);
 
-            Curl_bufq_write(&s->recvbuf,
-                            (unsigned char *)temp + stream->nwritten,
-                            stream->tun_data_buffered, &result);
-            Curl_bufq_write(&s->recvbuf,
-                            (unsigned char *)temp + stream->nwritten +
-                            stream->tun_data_buffered + nread,
-                            stream->last_data, &result);
+             Curl_bufq_write(&s->recvbuf,
+                              (unsigned char *)temp + stream->nwritten,
+                              stream->tun_data_buffered, &result);
+             Curl_bufq_write(&s->recvbuf,
+                              (unsigned char *)temp + stream->nwritten
+                                  + stream->tun_data_buffered + nread,
+                              stream->last_data, &result);
 
-            free(temp);
-            total_recv_len += (stream->nwritten + nread);
-            stream->tun_data_buffered = 0;
-            stream->last_data = 0;
-            stream->nwritten = 0;
-            stream->split_data = FALSE;
-            /* MASQUE FIX: Remove this later */
-            infof(data, "[cf_osslq_stream_recv] Reset stream->recvbuf, pending"
-                        " data in recvbuf = %zd ", Curl_bufq_len(&s->recvbuf));
-            break;
-          }
+             free(temp);
+             total_recv_len += (stream->nwritten + nread);
+             stream->tun_data_buffered = 0;
+             stream->last_data = 0;
+             stream->nwritten = 0;
+             stream->split_data = FALSE;
+             /* MASQUE FIX: Remove this later */
+             /* infof(data, "[cf_osslq_stream_recv]
+                Reset stream->recvbuf, pending" " data in recvbuf = %zd ",
+                                              Curl_bufq_len(&s->recvbuf));
+              */
+             break;
+           }
 
-          blen -= stream->tun_data_buffered;
-          Curl_bufq_skip(&s->recvbuf, blen);
-          total_recv_len += blen;
-          /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Clear recvbuf by %zu bytes,"
-                      " pending data in stream recvbuf %zd ", blen,
-                      Curl_bufq_len(&s->recvbuf));
-          break;
-        }
+           blen -= stream->tun_data_buffered;
+           Curl_bufq_skip(&s->recvbuf, blen);
+           total_recv_len += blen;
+           /* MASQUE FIX: Remove this later */
+           /* infof(data, "[cf_osslq_stream_recv] Clear
+              recvbuf by %zu bytes," " pending data in stream recvbuf %zd ",
+              blen, Curl_bufq_len(&s->recvbuf)); */
+           break;
+           }
 
         /* success, `nread` is the flow for QUIC to count as "consumed",
          * not sure how that will work with OpenSSL. Anyways, without error,
@@ -1501,8 +1504,8 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         total_recv_len += blen;
         if(Curl_bufq_is_empty(&s->recvbuf)) {
           /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Clear recvbuf by %zu bytes, "
-                      "all data in buffer processed", blen);
+          /* infof(data, "[cf_osslq_stream_recv] Clear recvbuf by %zu
+             bytes, " "all data in buffer processed", blen); */
           break;
         }
       }
@@ -1577,7 +1580,7 @@ static CURLcode proxy_h3_progress_ingress(struct Curl_cfilter *cf,
                                           struct Curl_easy *data)
 {
   /* MASQUE FIX: Remove this later */
-  infof(data, "[proxy_h3_progress_ingress] .......");
+  /* infof(data, "[proxy_h3_progress_ingress] ......."); */
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -1865,7 +1868,7 @@ static CURLcode proxy_h3_progress_egress(struct Curl_cfilter *cf,
                                          struct Curl_easy *data)
 {
   /* MASQUE FIX: Remove this later */
-  infof(data, "[proxy_h3_progress_egress] .......");
+  /* infof(data, "[proxy_h3_progress_egress] ......."); */
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -2655,11 +2658,11 @@ inspect_response_h3(struct Curl_cfilter *cf,
   DEBUGASSERT(ts->resp);
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
-      infof(data, "MASQUE FIX CONNECT-UDP Response 200 OK");
+      /* infof(data, "MASQUE FIX CONNECT-UDP Response 200 OK"); */
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
                                           "capsule-protocol");
       if(capsule_protocol) {
-        infof(data, "MASQUE FIX CONNECT-UDP Response Capsule-protocol");
+        /* infof(data, "MASQUE FIX CONNECT-UDP Response Capsule-protocol"); */
         if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
           infof(data, "CONNECT-UDP tunnel established, response %d",
                 ts->resp->status);

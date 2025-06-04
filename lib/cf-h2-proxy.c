@@ -1023,6 +1023,11 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
           return CURLE_OK;
         }
       }
+      else {
+        /* NOTE proxies may not set capsule protocol in the headers */
+        h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
+        return CURLE_OK;
+      }
     }
   }
   else {
@@ -1591,8 +1596,8 @@ process_capsules(struct Curl_easy *data,
   if(head >= TMP_BUF_SIZE)
     head -= TMP_BUF_SIZE;
 
-  infof(data, "MASQUE FIX [%ld] process_chunked_capsules "
-    "head=%ld, tail=%ld", idx, head, tail);
+  /* infof(data, "MASQUE FIX [%ld] process_chunked_capsules "
+    "head=%ld, tail=%ld", idx, head, tail); */
 
   return CURLE_OK;
 
@@ -1610,7 +1615,7 @@ decap_udp_payload_datagram2(struct Curl_easy *data,
   size_t num_msg = 32;
   CURLcode res;
 
-  infof(data, "MASQUE FIX [%d] filled buf received from SSL", count);
+  /* infof(data, "MASQUE FIX [%d] filled buf received from SSL", count); */
 
   for(idx = 0; idx < count; idx++) {
     /* append data from all the filled buffers in BIO_MSG to tmp_buf */
@@ -1631,10 +1636,10 @@ decap_udp_payload_datagram2(struct Curl_easy *data,
       break;
   }
 
-  infof(data, "MASQUE FIX [%ld] filled dgram sent to HTTP/3 QUIC", idx);
-  infof(data, "MASQUE FIX "
-        "head=%ld, tail=%ld, written=%ld, received=%ld",
-                              head, tail, written, received);
+  /* infof(data, "MASQUE FIX [%ld] filled dgram sent to HTTP/3 QUIC", idx);
+    infof(data, "MASQUE FIX "
+          "head=%ld, tail=%ld, written=%ld, received=%ld",
+                                head, tail, written, received); */
   return idx;
 }
 
