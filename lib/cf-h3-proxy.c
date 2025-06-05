@@ -1164,6 +1164,8 @@ cb_h3_read_data_for_tunnel_stream(nghttp3_conn *conn, int64_t stream_id,
     DEBUGASSERT(nvecs > 0); /* we SHOULD have been be able to peek */
   }
 
+  infof(data, "nvecs = %d, nwritten %zu, sendbuf_len_in_flight = %zu",
+        (int)nvecs, nwritten, stream->sendbuf_len_in_flight);
   if(nwritten > 0 && stream->upload_left != -1)
     stream->upload_left -= nwritten;
 
@@ -1252,6 +1254,9 @@ static CURLcode cf_osslq_h3conn_init(struct cf_osslq_ctx *ctx, SSL *conn,
 
   nghttp3_settings_default(&h3->settings);
   h3->settings.h3_datagram = 1;
+  h3->settings.enable_connect_protocol = 1;
+  h3->settings.qpack_max_dtable_capacity = 4096;
+  h3->settings.qpack_blocked_streams = 100;
   rc = nghttp3_conn_client_new(&h3->conn,
                                &ngh3_callbacks,
                                &h3->settings,
@@ -1383,6 +1388,9 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
       while(!eagain && !s->recvd_eos && !Curl_bufq_is_full(&s->recvbuf)) {
         nread = Curl_bufq_sipn(&s->recvbuf, 0, h3_quic_recv, &x, &result);
         if(nread < 0) {
+           /* MASQUE FIX: Remove this later */
+          infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
+               s->id, result);
           if(result != CURLE_AGAIN)
             goto out;
           result = CURLE_OK;
@@ -1390,8 +1398,8 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         }
         else {
           /* MASQUE FIX: Remove this later */
-          /* infof(data, "[cf_osslq_stream_recv] Stream %ld read %ld bytes",
-               s->id, nread); */
+          infof(data, "[cf_osslq_stream_recv] Stream %ld read %ld bytes",
+               s->id, nread);
         }
       }
     }
@@ -1785,20 +1793,27 @@ static CURLcode h3_send_streams(struct Curl_cfilter *cf,
     DEBUGASSERT(s->id == stream_id);
     for(i = 0, total_len = 0; i < n; ++i) {
       total_len += vec[i].len;
+        /* if(vec[i].len == 3)
+        infof(data, "[cf_h3_proxy_send] len == 3, "); */
     }
 
+    infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC stream %d",
+           s->id, total_len, stream_id);
     for(i = 0; (i < n) && !blocked; ++i) {
       /* Without stream->s.ssl, we closed that already, so
        * pretend the write did succeed. */
       uint64_t flags = (eos && ((i + 1) == n)) ? SSL_WRITE_FLAG_CONCLUDE : 0;
       if(stream_id == proxy_ctx->tunnel.stream_id) {
-        infof(data, "[h3_send_streams] not sending eos for tunnel"
-                    "stream %d", stream_id);
+        /* infof(data, "[h3_send_streams] not sending eos for tunnel"
+                    "stream %d", stream_id); */
         eos = 0;
       }
       written = vec[i].len;
       ok = !s->ssl || SSL_write_ex2(s->ssl, vec[i].base, vec[i].len, flags,
                                     &written);
+      infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC, "
+                  "written %zu bytes, eos=%d ok=%zu",
+           s->id, vec[i].len, written, eos, ok);
       if(ok) {
         /* As OpenSSL buffers the data, we count this as acknowledged
          * from nghttp3's point of view */
@@ -1962,6 +1977,36 @@ out:
 #define HTTP_INVALID_VARINT             ((uint64_t) ~0)
 #define HTTP_CAPSULE_HEADER_MAX_SIZE    10
 
+/* Decode a variable length integer according to HTTP/3 spec */
+static uint64_t
+http_decode_varint(char **start)
+{
+  uint8_t first_byte, bytes_left;
+  uint64_t value;
+  char *pos;
+
+  pos = *start;
+  first_byte = *pos;
+  pos++;
+
+  if(first_byte <= 0x3F) {
+    *start = pos;
+    return first_byte;
+  }
+
+  /* remove length bits, encoded in the first two bits of the first byte */
+  value = first_byte & 0x3F;
+  bytes_left = (1 << (first_byte >> 6)) - 1;
+
+  do {
+    value = (value << 8) | (uint8_t)(*pos);
+    pos++;
+  } while(--bytes_left);
+
+  *start = pos;
+  return value;
+}
+
 #define foreach_http_capsule_type _ (0, DATAGRAM)
 typedef enum http_capsule_type_
 {
@@ -2107,9 +2152,8 @@ struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
       curlx_dyn_addn(&dyn, &ctx_id, sizeof(ctx_id));
 
       curlx_dyn_addn(&dyn, buf, len);
-    }
-
-    if(data->conn->bits.udp_tunnel_proxy) {
+      if(len == 0)
+        infof(data, "[cf_h3_proxy_send] len == 0, ");
       nwritten = Curl_bufq_write(&stream->sendbuf,
                                  dyn.bufr, dyn.leng, err);
     }
@@ -2150,6 +2194,9 @@ out:
   return nwritten;
 }
 
+# define BIO_MSG_N(array, stride, n) \
+  (*(BIO_MSG *)((char *)(array) + (n)*(stride)))
+
 static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
                                 struct Curl_easy *data,
                                 char *buf, size_t len, CURLcode *err)
@@ -2161,6 +2208,7 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
   struct cf_call_data save;
   CURLcode result;
 
+  infof(data, "[cf_h3_proxy_recv] called, len=%zu", len);
   if(proxy_ctx->tunnel.closed)
     return nread;
 
@@ -2177,21 +2225,141 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
     goto out;
   }
 
-  if(!Curl_bufq_is_empty(&proxy_ctx->inbufq)) {
-    nread = Curl_bufq_read(&proxy_ctx->inbufq,
-                           (unsigned char *)buf, len, err);
-    if(nread < 0) {
-      CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] read recvbuf(len=%zu) "
-                            "-> %zd, %d",
-                  stream->s.id, len, nread, *err);
-      goto out;
+  if(!data->conn->bits.udp_tunnel_proxy) {
+    if(!Curl_bufq_is_empty(&proxy_ctx->inbufq)) {
+      nread = Curl_bufq_read(&proxy_ctx->inbufq,
+                              (unsigned char *)buf, len, err);
+      if(nread < 0) {
+        CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] read recvbuf(len=%zu) "
+                                "-> %zd, %d",
+                        stream->s.id, len, nread, *err);
+        goto out;
+      }
     }
-}
+  }
 
   result = proxy_h3_progress_ingress(cf, data);
   if(result) {
     *err = result;
     nread = -1;
+    goto out;
+  }
+
+  if(data->conn->bits.udp_tunnel_proxy) {
+    BIO_MSG *my_bio = (BIO_MSG*)buf;
+    /* MASQUE FIX: how to get this value from OpenSSL code? */
+    size_t num_msg = 32;
+    size_t stride = len;
+    uint8_t idx = 0;
+    CURLcode result = CURLE_OK;
+
+    /* Parse data in proxy_ctx->inbufq, which is formatted as udp capsules,
+       into BIO_MSG structures obtained from BIO_MSG_N (my_bio, stride, idx),
+       so that we can use the BIO_MSG API to read them.
+       The data is formatted as:
+       [capsule_type][varint_length][context_id][data] where capsule_type is 0
+       for HTTP Datagram, context_id is 0 for UDP Proxying Payload, and data is
+       the actual payload.
+    */
+
+    /* Process available capsules from inbufq until full or no more data */
+    while(idx < num_msg && !Curl_bufq_is_empty(&proxy_ctx->inbufq)) {
+      uint64_t capsule_length;
+      uint8_t *context_id, *capsule_type;
+      unsigned char *capsule_data;
+      unsigned char *temp_buf;
+      size_t read_size, temp_size = 0;
+      char *decode_ptr;
+      unsigned int offset = 0;
+
+      /* Read the capsule type (should be 0 for HTTP Datagram) */
+      if(!Curl_bufq_peek(&proxy_ctx->inbufq, &capsule_type, &read_size)) {
+        break;
+      }
+
+      if(capsule_type[0]) {
+        infof(data, "Error! Invalid capsule type: %02x", capsule_type);
+        result = CURLE_RECV_ERROR;
+        break;
+      }
+
+      /* Read enough bytes to determine varint length
+       * NOTE handle spread over multiple chunks */
+      Curl_bufq_peek_at(&proxy_ctx->inbufq, 1,
+                         (const unsigned char **)&temp_buf, &temp_size);
+      if(temp_size < 1)
+        break;
+
+      offset += 1;
+      /* Determine varint length */
+      decode_ptr = (char *)temp_buf;
+      capsule_length = http_decode_varint(&decode_ptr);
+
+      if(capsule_length == HTTP_INVALID_VARINT) {
+        infof(data, "Error! Invalid varint length encoding");
+        result = CURLE_RECV_ERROR;
+        break;
+      }
+
+      /* Skip over the varint in the actual buffer */
+      offset += (decode_ptr - (char *)temp_buf);
+
+      /* Read context ID (should be 0 for UDP Proxying Payload) */
+      if(!Curl_bufq_peek_at(&proxy_ctx->inbufq, offset, &context_id,
+                              &read_size)) {
+          break;
+        }
+
+      if(*context_id) {
+        infof(data, "Error! Invalid context ID: %02x", context_id);
+        result = CURLE_RECV_ERROR;
+        break;
+      }
+
+      /* Skip over the context ID */
+      offset += 1;
+
+      /* Adjust length (subtract context ID length) */
+      capsule_length--;
+      if(Curl_bufq_len(&proxy_ctx->inbufq) < offset + capsule_length) {
+        infof(data, "Error! Not enough data for capsule length: %zu",
+              capsule_length);
+        result = CURLE_OK;
+        break;
+      }
+
+      /* Get a pointer to the BIO_MSG data buffer */
+      capsule_data = (unsigned char *)BIO_MSG_N(my_bio, stride, idx).data;
+      size_t data_buf_size = BIO_MSG_N(my_bio, stride, idx).data_len;
+
+      if(data_buf_size < capsule_length) {
+        infof(data, "Error! Capsule too large: %zd", capsule_length);
+        result = CURLE_RECV_ERROR;
+        break;
+      }
+
+      /* Read the actual payload data */
+      size_t bytes_read = Curl_bufq_read(&proxy_ctx->inbufq, capsule_data,
+                                         capsule_length, err);
+
+      if(bytes_read != capsule_length) {
+        infof(data, "Error! Read less than expected %zd %zd", capsule_length,
+              bytes_read);
+        result = CURLE_RECV_ERROR;
+        break;
+      }
+
+      Curl_bufq_skip(&proxy_ctx->inbufq, capsule_length + offset);
+
+      /* Set the actual data length in the BIO_MSG structure */
+      BIO_MSG_N(my_bio, stride, idx).data_len = bytes_read;
+
+      /* Move to the next message */
+      idx++;
+
+      CURL_TRC_CF(data, cf, "Processed UDP capsule: size=%zu", capsule_length);
+    }
+    nread = idx;
     goto out;
   }
 
@@ -2670,6 +2838,12 @@ inspect_response_h3(struct Curl_cfilter *cf,
           return CURLE_OK;
         }
       }
+      else {
+        /* infof(data, "FIX MASQUE CONNECT-UDP Response 200 OK, "
+                    "but no capsule-protocol header found"); */
+        h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
+        return CURLE_OK;
+      }
     }
   }
   else {
@@ -2730,15 +2904,15 @@ static CURLcode cf_h3_proxy_quic_connect(struct Curl_cfilter *cf,
     }
   }
 
+  *done = FALSE;
+  now = curlx_now();
+  CF_DATA_SAVE(save, cf, data);
+
   if(!proxy_ctx->osslq_ctx) {
     result = cf_h3_proxy_ctx_init(cf, data);
     if(result)
       return result;
   }
-
-  *done = FALSE;
-  now = curlx_now();
-  CF_DATA_SAVE(save, cf, data);
 
   if(!proxy_ctx->osslq_ctx->got_first_byte) {
     int readable = SOCKET_READABLE(proxy_ctx->osslq_ctx->q.sockfd, 0);
@@ -2830,7 +3004,8 @@ out:
     }
   }
 #endif
-  if(!result)
+  /* Maybe extreme but avoid seding data before quic handshake is done */
+  if(!result && !SSL_in_init(proxy_ctx->osslq_ctx->tls.ossl.ssl))
     result = check_and_set_expiry(cf, data);
   if(result || *done) {
     CURL_TRC_CF(data, cf, "connect -> %d, done=%d", result, *done);
@@ -2862,15 +3037,27 @@ static CURLcode H3_CONNECT(struct Curl_cfilter *cf,
       h3_tunnel_go_state(cf, ts, H3_TUNNEL_CONNECT, data);
       FALLTHROUGH();
 
-    result = proxy_h3_progress_egress(cf, data);
-    if(result)
-      goto out;
+      result = proxy_h3_progress_egress(cf, data);
+      if(result)
+        goto out;
 
     case H3_TUNNEL_CONNECT:
       while(ts->has_final_response == FALSE) {
         result = proxy_h3_progress_ingress(cf, data);
         if(result)
           goto out;
+        /*
+        result = proxy_h3_progress_ingress(cf, data);
+        if(result && result != CURLE_AGAIN) {
+          h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
+          goto out;
+        }
+        */
+        result = proxy_h3_progress_egress(cf, data);
+        if(result && result != CURLE_AGAIN) {
+          h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
+          goto out;
+        }
       }
       if(result && result != CURLE_AGAIN) {
         h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
