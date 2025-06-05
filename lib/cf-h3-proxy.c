@@ -24,7 +24,8 @@
 
 #include "curl_setup.h"
 
-#if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY)
+/* #if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY) */
+#if 1
 
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
@@ -926,8 +927,8 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   }
 
   /* MASQUE FIX: Remove this later */
-  /*   infof(data, "[cb_h3_recv_data.......] "
-      "stream ID %zd, buflen %zu", stream->s.id, buflen); */
+  infof(data, "[cb_h3_recv_data.......] "
+      "stream ID %zd, buflen %zu", stream->s.id, buflen);
 
   stream->tun_data_recvd += (curl_off_t)buflen;
   CURL_TRC_CF(data, cf, "[cb_h3_recv_data] "
@@ -939,6 +940,7 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
                 stream->s.id, buflen, stream->tun_data_recvd); */
 
   if(proxy_ctx->partial_read) {
+    infof(data, "[BIG ISSUE] partial data?");
     stream->split_data = TRUE;
     stream->nwritten = nwritten > 0 ? nwritten : 0;
     stream->last_data = buflen;
@@ -946,16 +948,18 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   }
 
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
+  infof(data, "[cb_h3_recv_data] total len %u",
+        Curl_bufq_len(&proxy_ctx->inbufq));
   if(nwritten < 0) {
     /* MASQUE FIX: Remove this later */
-    /* infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten); */
+    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
     proxy_ctx->partial_read = TRUE;
     stream->tun_data_buffered = (curl_off_t)(buflen);
     return 0;
   }
   else if(nwritten < buflen) {
     /* MASQUE FIX: Remove this later */
-    /* infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten); */
+    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
     proxy_ctx->partial_read = TRUE;
     stream->tun_data_buffered = (curl_off_t)(buflen - nwritten);
     return 0;
@@ -1253,7 +1257,7 @@ static CURLcode cf_osslq_h3conn_init(struct cf_osslq_ctx *ctx, SSL *conn,
   int rc;
 
   nghttp3_settings_default(&h3->settings);
-  h3->settings.h3_datagram = 1;
+  /* h3->settings.h3_datagram = 1; */
   h3->settings.enable_connect_protocol = 1;
   h3->settings.qpack_max_dtable_capacity = 4096;
   h3->settings.qpack_blocked_streams = 100;
@@ -1389,8 +1393,8 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         nread = Curl_bufq_sipn(&s->recvbuf, 0, h3_quic_recv, &x, &result);
         if(nread < 0) {
            /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
-               s->id, result);
+           /* infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
+               s->id, result); */
           if(result != CURLE_AGAIN)
             goto out;
           result = CURLE_OK;
@@ -2253,6 +2257,12 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
     uint8_t idx = 0;
     CURLcode result = CURLE_OK;
 
+    if(Curl_bufq_is_empty(&proxy_ctx->inbufq)) {
+      /* No data to process, return 0 */
+      *err = CURLE_AGAIN;
+      nread = -1;
+      goto out;
+    }
     /* Parse data in proxy_ctx->inbufq, which is formatted as udp capsules,
        into BIO_MSG structures obtained from BIO_MSG_N (my_bio, stride, idx),
        so that we can use the BIO_MSG API to read them.
@@ -2264,13 +2274,12 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
 
     /* Process available capsules from inbufq until full or no more data */
     while(idx < num_msg && !Curl_bufq_is_empty(&proxy_ctx->inbufq)) {
-      uint64_t capsule_length;
       uint8_t *context_id, *capsule_type;
       unsigned char *capsule_data;
       unsigned char *temp_buf;
       size_t read_size, temp_size = 0;
       char *decode_ptr;
-      unsigned int offset = 0;
+      size_t offset = 0, capsule_length;
 
       /* Read the capsule type (should be 0 for HTTP Datagram) */
       if(!Curl_bufq_peek(&proxy_ctx->inbufq, &capsule_type, &read_size)) {
@@ -2278,19 +2287,20 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
       }
 
       if(capsule_type[0]) {
-        infof(data, "Error! Invalid capsule type: %02x", capsule_type);
+        infof(data, "Error! Invalid capsule type: %zd", *capsule_type);
         result = CURLE_RECV_ERROR;
         break;
       }
 
+      offset += 1;
+
       /* Read enough bytes to determine varint length
        * NOTE handle spread over multiple chunks */
-      Curl_bufq_peek_at(&proxy_ctx->inbufq, 1,
+      Curl_bufq_peek_at(&proxy_ctx->inbufq, offset,
                          (const unsigned char **)&temp_buf, &temp_size);
       if(temp_size < 1)
         break;
 
-      offset += 1;
       /* Determine varint length */
       decode_ptr = (char *)temp_buf;
       capsule_length = http_decode_varint(&decode_ptr);
@@ -2338,6 +2348,8 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
         break;
       }
 
+      Curl_bufq_skip(&proxy_ctx->inbufq, offset);
+
       /* Read the actual payload data */
       size_t bytes_read = Curl_bufq_read(&proxy_ctx->inbufq, capsule_data,
                                          capsule_length, err);
@@ -2349,15 +2361,14 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
         break;
       }
 
-      Curl_bufq_skip(&proxy_ctx->inbufq, capsule_length + offset);
-
       /* Set the actual data length in the BIO_MSG structure */
       BIO_MSG_N(my_bio, stride, idx).data_len = bytes_read;
 
       /* Move to the next message */
       idx++;
 
-      CURL_TRC_CF(data, cf, "Processed UDP capsule: size=%zu", capsule_length);
+      infof(data, "Processed UDP capsule: size=%zu length_left %zu",
+             capsule_length, Curl_bufq_len(&proxy_ctx->inbufq));
     }
     nread = idx;
     goto out;
