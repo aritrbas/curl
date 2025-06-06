@@ -350,8 +350,12 @@ CURLcode Curl_http_proxy_create_CONNECTUDP(struct httpreq **preq,
     goto out;
   }
 
-  /* MASQUE FIX: The "hostname" needs fix */
-  path = aprintf("/.well-known/masque/udp/%s/%d/", hostname, port);
+  /* MASQUE FIX: envoy and h2o has different behaviour */
+  /* envoy expects path --> "/.well-known/masque/udp/<host>/<port/" */
+  /* path = aprintf("/.well-known/masque/udp/%s/%d/", hostname, port); */
+  /* h2o expects path --> "/.well-known/masque/udp/<host>/<port/" */
+  path = aprintf("/%s/%d/", hostname, port);
+
   if(!path) {
     result = CURLE_OUT_OF_MEMORY;
     goto out;
@@ -449,6 +453,10 @@ static CURLcode http_proxy_cf_connect(struct Curl_cfilter *cf,
 {
   struct cf_proxy_ctx *ctx = cf->ctx;
   CURLcode result;
+  const char *tunnel_type;  /* Determine tunnel type once and reuse */
+
+  tunnel_type = cf->conn->bits.udp_tunnel_proxy ?
+                "CONNECT-UDP tunnel" : "CONNECT tunnel";
 
   if(cf->connected) {
     *done = TRUE;
@@ -482,14 +490,8 @@ connect_sub:
     case CURL_HTTP_VERSION_1_0:
     case CURL_HTTP_VERSION_1_1:
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/1.1");
-      if(cf->conn->bits.udp_tunnel_proxy) {
-        infof(data, "CONNECT-UDP tunnel: HTTP/1.%d negotiated",
-            (alpn == CURL_HTTP_VERSION_1_0) ? 0 : 1);
-      }
-      else {
-        infof(data, "CONNECT tunnel: HTTP/1.%d negotiated",
-            (alpn == CURL_HTTP_VERSION_1_0) ? 0 : 1);
-      }
+      infof(data, "Negotiating %s for HTTP/1.%d", tunnel_type,
+             (alpn == CURL_HTTP_VERSION_1_0) ? 0 : 1);
       result = Curl_cf_h1_proxy_insert_after(cf, data);
       if(result)
         goto out;
@@ -499,12 +501,7 @@ connect_sub:
 #ifdef USE_NGHTTP2
     case CURL_HTTP_VERSION_2:
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/2");
-      if(cf->conn->bits.udp_tunnel_proxy) {
-        infof(data, "CONNECT-UDP tunnel: HTTP/2 negotiated");
-      }
-      else {
-        infof(data, "CONNECT tunnel: HTTP/2 negotiated");
-      }
+      infof(data, "Negotiating %s for HTTP/2", tunnel_type);
       result = Curl_cf_h2_proxy_insert_after(cf, data);
       if(result)
         goto out;
@@ -515,10 +512,7 @@ connect_sub:
 #ifdef USE_NGHTTP3
     case CURL_HTTP_VERSION_3ONLY:
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/3");
-      if(cf->conn->bits.udp_tunnel_proxy)
-        infof(data, "CONNECT-UDP tunnel: HTTP/3 negotiated");
-      else
-        infof(data, "CONNECT tunnel: HTTP/3 negotiated");
+      infof(data, "Negotiating %s for HTTP/3", tunnel_type);
       result = Curl_cf_h3_proxy_insert_after(&cf, data);
       if(result)
         goto out;
@@ -527,7 +521,7 @@ connect_sub:
       break;
 #endif
     default:
-      infof(data, "CONNECT tunnel: unsupported ALPN(%d) negotiated", alpn);
+      infof(data, "Unsupported ALPN(%d) negotiated for %s", tunnel_type, alpn);
       result = CURLE_COULDNT_CONNECT;
       goto out;
     }

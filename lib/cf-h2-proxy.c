@@ -155,10 +155,10 @@ static void h2_tunnel_go_state(struct Curl_cfilter *cf,
     CURL_TRC_CF(data, cf, "[%d] new tunnel state 'established'",
                 ts->stream_id);
     if(cf->conn->bits.udp_tunnel_proxy) {
-      infof(data, "CONNECT-UDP phase completed");
+      infof(data, "CONNECT-UDP phase completed for HTTP/2 proxy");
     }
     else {
-      infof(data, "CONNECT phase completed");
+      infof(data, "CONNECT phase completed for HTTP/2 proxy");
     }
     data->state.authproxy.done = TRUE;
     data->state.authproxy.multipass = FALSE;
@@ -977,12 +977,11 @@ static CURLcode submit_CONNECT(struct Curl_cfilter *cf,
   if(result)
     goto out;
 
-  if(cf->conn->bits.udp_tunnel_proxy) {
-    infof(data, "Establish HTTP/2 proxy UDP tunnel to %s", req->authority);
-  }
-  else {
-    infof(data, "Establish HTTP/2 proxy tunnel to %s", req->authority);
-  }
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "Establishing HTTP/2 proxy UDP tunnel to %s:%s",
+                        data->state.up.hostname, data->state.up.port);
+  else
+    infof(data, "Establishing HTTP/2 proxy tunnel to %s", req->authority);
 
   result = proxy_h2_submit(&ts->stream_id, cf, data, ctx->h2, req,
                            NULL, ts, tunnel_send_callback, cf);
@@ -1011,11 +1010,12 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
   DEBUGASSERT(ts->resp);
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
-      infof(data, "MASQUE FIX CONNECT-UDP Response 200 OK");
+      infof(data, "MASQUE FIX: CONNECT-UDP Response --> 200 OK");
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
                                 "capsule-protocol");
       if(capsule_protocol) {
-        infof(data, "MASQUE FIX CONNECT-UDP Response Capsule-protocol");
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
+                                        "Capsule-protocol: ?1");
         if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
           infof(data, "CONNECT-UDP tunnel established, response %d",
                     ts->resp->status);
@@ -1025,9 +1025,17 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
       }
       else {
         /* NOTE proxies may not set capsule protocol in the headers */
+        infof(data, "MASQUE FIX: CONNECT-UDP Response 200 OK, "
+                    "but no capsule-protocol header found");
         h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
         return CURLE_OK;
       }
+    }
+    else {
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d",
+            ts->resp->status);
+        h2_tunnel_go_state(cf, ts, H2_TUNNEL_FAILED, data);
+        return CURLE_RECV_ERROR;
     }
   }
   else {
