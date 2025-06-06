@@ -166,12 +166,11 @@ static void h1_tunnel_go_state(struct Curl_cfilter *cf,
 
   case H1_TUNNEL_ESTABLISHED:
     CURL_TRC_CF(data, cf, "new tunnel state 'established'");
-    if(cf->conn->bits.udp_tunnel_proxy) {
-      infof(data, "CONNECT-UDP phase completed");
-    }
-    else {
-      infof(data, "CONNECT phase completed");
-    }
+    if(cf->conn->bits.udp_tunnel_proxy)
+      infof(data, "CONNECT-UDP phase completed for HTTP proxy");
+    else
+      infof(data, "CONNECT phase completed for HTTP proxy");
+
     data->state.authproxy.done = TRUE;
     data->state.authproxy.multipass = FALSE;
     FALLTHROUGH();
@@ -235,12 +234,11 @@ static CURLcode start_CONNECT(struct Curl_cfilter *cf,
   if(result)
     goto out;
 
-  if(cf->conn->bits.udp_tunnel_proxy) {
-    infof(data, "Establish HTTP UDP proxy tunnel to %s", req->authority);
-  }
-  else {
-    infof(data, "Establish HTTP proxy tunnel to %s", req->authority);
-  }
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "Establishing HTTP proxy UDP tunnel to %s:%s",
+                      data->state.up.hostname, data->state.up.port);
+  else
+    infof(data, "Establishing HTTP proxy tunnel to %s", req->authority);
 
   curlx_dyn_reset(&ts->request_data);
   ts->nsent = 0;
@@ -306,7 +304,8 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     if(Curl_compareheader(header,
                            STRCONST("Transfer-Encoding:"),
                            STRCONST("chunked"))) {
-      infof(data, "MASQUE FIX CONNECT-UDP Response Transfer-Encoding");
+      infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
+                  "Transfer-Encoding: chunked");
       ts->chunked_encoding = TRUE;
       /* reset our chunky engine */
       Curl_httpchunk_reset(data, &ts->ch, TRUE);
@@ -316,13 +315,13 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     if(Curl_compareheader(header,
                            STRCONST("Capsule-protocol:"),
                            STRCONST("?1"))) {
-      infof(data, "MASQUE FIX CONNECT-UDP Response Capsule-protocol");
+      infof(data, "MASQUE FIX: CONNECT-UDP Response --> Capsule-protocol: ?1");
     }
   }
   else if(Curl_compareheader(header,
                               STRCONST("Connection:"), STRCONST("close"))) {
     ts->close_connection = TRUE;
-    infof(data, "MASQUE FIX CONNECT-UDP Response Connection: close");
+    infof(data, "MASQUE FIX: CONNECT-UDP Response --> Connection: close");
   }
   else if(!strncmp(header, "HTTP/1.", 7) &&
            ((header[7] == '0') || (header[7] == '1')) &&
@@ -332,7 +331,7 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     /* store the HTTP code from the proxy */
     data->info.httpproxycode = k->httpcode = (header[9] - '0') * 100 +
                           (header[10] - '0') * 10 + (header[11] - '0');
-    infof(data, "MASQUE FIX CONNECT-UDP Response 200 OK");
+    infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d", k->httpcode);
   }
   return result;
 }
@@ -681,25 +680,40 @@ static CURLcode H1_CONNECT(struct Curl_cfilter *cf,
   } while(data->req.newurl);
 
   DEBUGASSERT(ts->tunnel_state == H1_TUNNEL_RESPONSE);
-  if(data->info.httpproxycode/100 != 2) {
-    /* a non-2xx response and we have no next URL to try. */
-    Curl_safefree(data->req.newurl);
-    /* failure, close this connection to avoid reuse */
-    streamclose(conn, "proxy CONNECT failure");
-    h1_tunnel_go_state(cf, ts, H1_TUNNEL_FAILED, data);
-    failf(data, "CONNECT tunnel failed, response %d", data->req.httpcode);
-    return CURLE_RECV_ERROR;
-  }
-  /* 2xx response, SUCCESS! */
-  h1_tunnel_go_state(cf, ts, H1_TUNNEL_ESTABLISHED, data);
   if(cf->conn->bits.udp_tunnel_proxy) {
-    infof(data, "CONNECT-UDP tunnel established, response %d",
-                data->info.httpproxycode);
+    /* MASQUE FIX: envoy and h2o has different behaviour */
+    /* envoy returns 200 OK, h2o returns 101 Switching Protocols */
+    if(data->info.httpproxycode != 200 && data->info.httpproxycode != 101) {
+      /* a non-2xx response and we have no next URL to try. */
+      Curl_safefree(data->req.newurl);
+      /* failure, close this connection to avoid reuse */
+      streamclose(conn, "proxy CONNECT-UDP failure");
+      h1_tunnel_go_state(cf, ts, H1_TUNNEL_FAILED, data);
+      failf(data, "CONNECT-UDP tunnel failed, response %d",
+                                        data->req.httpcode);
+      return CURLE_RECV_ERROR;
+    }
   }
   else {
-  infof(data, "CONNECT tunnel established, response %d",
-        data->info.httpproxycode);
+    if(data->info.httpproxycode/100 != 2) {
+      /* a non-2xx response and we have no next URL to try. */
+      Curl_safefree(data->req.newurl);
+      /* failure, close this connection to avoid reuse */
+      streamclose(conn, "proxy CONNECT failure");
+      h1_tunnel_go_state(cf, ts, H1_TUNNEL_FAILED, data);
+      failf(data, "CONNECT tunnel failed, response %d", data->req.httpcode);
+      return CURLE_RECV_ERROR;
+    }
   }
+  /* 2xx response, SUCCESS! */
+  /* 101 Switching Protocol for CONNECT-UDP */
+  h1_tunnel_go_state(cf, ts, H1_TUNNEL_ESTABLISHED, data);
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "CONNECT-UDP tunnel established, response %d",
+                                    data->info.httpproxycode);
+  else
+    infof(data, "CONNECT tunnel established, response %d",
+                                    data->info.httpproxycode);
   result = CURLE_OK;
 
 out:
@@ -1148,6 +1162,108 @@ out:
   return CURLE_RECV_ERROR;
 }
 
+static CURLcode
+process_capsules(struct Curl_easy *data,
+                 char *buf, size_t stride, size_t idx)
+{
+  size_t avail_bytes;
+  size_t unwrapped_bytes;
+  char temp[8] = {0};
+  char *decode;
+  char *capsule_start;
+  uint64_t ptr = head;
+  uint8_t index = 0;
+  size_t var_enc_bytes;
+  uint64_t capsule_length;
+  size_t bytes_to_copy;
+
+  BIO_MSG *my_bio = (BIO_MSG*)buf;
+  char *dgram = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
+
+  avail_bytes = (tail >= head) ? (tail - head) : (TMP_BUF_SIZE - head + tail);
+  /* infof(data, "[%d] Avail Bytes = %lld", idx, avail_bytes); */
+  if(avail_bytes < 3)
+    goto out;
+
+  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
+    infof(data, "Error! Invalid capsule start byte: %02x",
+          tmp_buf[ptr % TMP_BUF_SIZE]);
+    goto out;
+  }
+  ptr++;
+  /* --> At this point, "ptr" is pointing at beginning of var_enc_bytes */
+
+  /* "0x00" (1 byte) */
+  avail_bytes--;
+
+  decode = tmp_buf + (ptr % TMP_BUF_SIZE);
+  var_enc_bytes = http_var_length_bytes(decode);
+
+  index = 0;
+  while(index < var_enc_bytes) {
+    temp[index] = tmp_buf[ptr % TMP_BUF_SIZE];
+    ptr++;
+    index++;
+  }
+  /* --> At this point, "ptr" is pointing at context ID */
+
+  decode = &temp[0];
+  capsule_length = http_decode_varint(&decode);
+
+  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
+    infof(data, "Error! Invalid context ID: %02x",
+          tmp_buf[ptr % TMP_BUF_SIZE]);
+    goto out;
+  }
+  ptr++;
+  capsule_length--;
+  /* --> At this point, "ptr" is pointing at beginning of capsule */
+
+  /* var_enc bytes +  "0x00" (1 byte) */
+  avail_bytes = avail_bytes - var_enc_bytes - 1;
+
+  if(avail_bytes < capsule_length) {
+    infof(data, "MASQUE FIX [%ld] Incomplete capsule received, bailing", idx);
+    goto out;
+  }
+
+  head = ptr % TMP_BUF_SIZE;
+  unwrapped_bytes = (head < tail) ? (tail - head) : (TMP_BUF_SIZE - head);
+
+  capsule_start = tmp_buf + head;
+  /* Copy payload, handling wrap if needed */
+  if(unwrapped_bytes >= capsule_length) {
+    /* Continuous copy */
+    memcpy(dgram, capsule_start, capsule_length);
+  }
+  else {
+    /* Split circular copy */
+    bytes_to_copy = TMP_BUF_SIZE - head;
+    memcpy(dgram, capsule_start, bytes_to_copy);
+    memcpy(dgram + bytes_to_copy, tmp_buf,
+            capsule_length - bytes_to_copy);
+  }
+
+  BIO_MSG_N(my_bio, stride, idx).data_len = capsule_length;
+  /* infof(data, "MASQUE FIX %lld dgram filled", capsule_length); */
+
+  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
+  written += capsule_length + var_enc_bytes + 2;
+
+  /* Update head */
+  head = head + capsule_length;
+  if(head >= TMP_BUF_SIZE)
+    head -= TMP_BUF_SIZE;
+
+  /* infof(data, "MASQUE FIX [%ld] process_chunked_capsules "
+    "head=%ld, tail=%ld", idx, head, tail); */
+
+  return CURLE_OK;
+
+out:
+  return CURLE_RECV_ERROR;
+}
+
 static size_t
 decap_udp_payload_datagram2(struct Curl_easy *data,
                             char *buf, uint8_t count,
@@ -1167,14 +1283,20 @@ decap_udp_payload_datagram2(struct Curl_easy *data,
       break;
 
     /* process capsules from circular buffer */
-    res = process_chunked_capsules(data, buf, stride, idx);
+    /* MASQUE FIX: envoy and h2o has different behaviour */
+    /* envoy sends chunked capsule, h2o just sends capsules */
+    /* res = process_chunked_capsules(data, buf, stride, idx); */
+    res = process_capsules(data, buf, stride, idx);
     if(res != CURLE_OK)
       break;
   }
 
   /* process capsules from circular buffer */
   for(; idx < num_msg; idx++) {
-    res = process_chunked_capsules(data, buf, stride, idx);
+    /* MASQUE FIX: envoy and h2o has different behaviour */
+    /* envoy sends chunked capsule, h2o just sends capsules */
+    /* res = process_chunked_capsules(data, buf, stride, idx); */
+    res = process_capsules(data, buf, stride, idx);
     if(res != CURLE_OK)
       break;
   }

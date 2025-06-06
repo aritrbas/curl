@@ -303,10 +303,10 @@ static void h3_tunnel_go_state(struct Curl_cfilter *cf,
     CURL_TRC_CF(data, cf, "[%d] new tunnel state 'established'",
                 ts->stream_id);
     if(cf->conn->bits.udp_tunnel_proxy) {
-      infof(data, "CONNECT-UDP phase completed");
+      infof(data, "CONNECT-UDP phase completed for HTTP/3 proxy");
     }
     else {
-      infof(data, "CONNECT phase completed");
+      infof(data, "CONNECT phase completed for HTTP/3 proxy");
     }
     data->state.authproxy.done = TRUE;
     data->state.authproxy.multipass = FALSE;
@@ -1417,7 +1417,7 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
           cf_h3_proxy_quic_connect() --> proxy_h3_submit() -->
           proxy_h3_progress_egress() --> proxy_h3_progress_ingress() -->
           cf_osslq_h3conn_add_stream() --> cf_osslq_stream_recv() -->
-          inspect_response_h3() --> tunnel is UP (with bidi stream id = 0)
+          inspect_response() --> tunnel is UP (with bidi stream id = 0)
       (2) The proxytunnel is UP
           At this point, we have 7 streams - 1 bidi (the tunnel stream) and
           6 unidirectional streams (3 from curl and 3 from the proxy)
@@ -2504,10 +2504,10 @@ static void proxy_h3_submit(int32_t *pstream_id,
   }
 
   if(Curl_trc_is_verbose(data)) {
-    infof(data, "[HTTP/3] [%" FMT_PRId64 "] OPENED stream for %s",
+    infof(data, "[H3-PROXY] [%" FMT_PRId64 "] OPENED stream for %s",
           stream->s.id, data->state.url);
     for(i = 0; i < nheader; ++i) {
-      infof(data, "[HTTP/3] [%" FMT_PRId64 "] [%.*s: %.*s]",
+      infof(data, "[H3-PROXY] [%" FMT_PRId64 "] [%.*s: %.*s]",
             stream->s.id,
             (int)nva[i].namelen, nva[i].name,
             (int)nva[i].valuelen, nva[i].value);
@@ -2807,12 +2807,11 @@ static CURLcode submit_CONNECT(struct Curl_cfilter *cf,
   if(result)
     goto out;
 
-  if(cf->conn->bits.udp_tunnel_proxy) {
-    infof(data, "Establish HTTP/3 proxy UDP tunnel to %s", req->authority);
-  }
-  else {
-    infof(data, "Establish HTTP/3 proxy tunnel to %s", req->authority);
-  }
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "Establishing HTTP/3 proxy UDP tunnel to %s:%d",
+                        data->state.up.hostname, data->state.up.port);
+  else
+    infof(data, "Establishing HTTP/3 proxy tunnel to %s", req->authority);
 
   proxy_h3_submit(&ts->stream_id, cf, data, req, &result);
 
@@ -2825,9 +2824,9 @@ out:
 }
 
 static CURLcode
-inspect_response_h3(struct Curl_cfilter *cf,
-                    struct Curl_easy *data,
-                    struct tunnel_stream *ts)
+inspect_response(struct Curl_cfilter *cf,
+                 struct Curl_easy *data,
+                 struct tunnel_stream *ts)
 {
   CURLcode result = CURLE_OK;
   struct dynhds_entry *auth_reply = NULL;
@@ -2837,24 +2836,32 @@ inspect_response_h3(struct Curl_cfilter *cf,
   DEBUGASSERT(ts->resp);
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
-      /* infof(data, "MASQUE FIX CONNECT-UDP Response 200 OK"); */
+      infof(data, "MASQUE FIX: CONNECT-UDP Response --> 200 OK");
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
                                           "capsule-protocol");
       if(capsule_protocol) {
-        /* infof(data, "MASQUE FIX CONNECT-UDP Response Capsule-protocol"); */
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
+                                        "Capsule-protocol: ?1");
         if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
           infof(data, "CONNECT-UDP tunnel established, response %d",
-                ts->resp->status);
+                    ts->resp->status);
           h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
           return CURLE_OK;
         }
       }
       else {
-        /* infof(data, "FIX MASQUE CONNECT-UDP Response 200 OK, "
-                    "but no capsule-protocol header found"); */
+        /* NOTE proxies may not set capsule protocol in the headers */
+        infof(data, "MASQUE FIX: CONNECT-UDP Response 200 OK, "
+                    "but no capsule-protocol header found");
         h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
         return CURLE_OK;
       }
+    }
+    else {
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d",
+            ts->resp->status);
+        h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
+        return CURLE_RECV_ERROR;
     }
   }
   else {
@@ -3085,7 +3092,7 @@ static CURLcode H3_CONNECT(struct Curl_cfilter *cf,
 
     case H3_TUNNEL_RESPONSE:
       DEBUGASSERT(ts->has_final_response);
-      result = inspect_response_h3(cf, data, ts);
+      result = inspect_response(cf, data, ts);
       if(result)
         goto out;
       ctx->connected = TRUE;
