@@ -2370,7 +2370,8 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
       infof(data, "Processed UDP capsule: size=%zu length_left %zu",
              capsule_length, Curl_bufq_len(&proxy_ctx->inbufq));
     }
-    nread = idx;
+    nread = idx ? idx : -1;
+    *err = CURLE_AGAIN;
     goto out;
   }
 
