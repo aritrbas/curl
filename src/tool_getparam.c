@@ -1973,6 +1973,12 @@ static ParameterError opt_bool(struct GlobalConfig *global,
 
     config->proxyver = toggle ? CURLPROXY_HTTPS2 : CURLPROXY_HTTPS;
     break;
+  case C_PROXY_HTTP3: /* --proxy-http3 */
+    if(!feature_httpsproxy || !feature_http3)
+      return PARAM_LIBCURL_DOESNT_SUPPORT;
+
+    config->proxyver = toggle ? CURLPROXY_HTTPS3 : CURLPROXY_HTTPS;
+    break;
   case C_APPEND: /* --append */
     config->ftp_append = toggle;
     break;
@@ -2124,6 +2130,10 @@ static ParameterError opt_bool(struct GlobalConfig *global,
     break;
   case C_PROXYTUNNEL: /* --proxytunnel */
     config->proxytunnel = toggle;
+    break;
+  case C_PROXYUDPTUNNEL: /* --proxyudptunnel */
+    /* UDP proxy tunnel for non-http protocols */
+    config->proxyudptunnel = toggle;
     break;
   case C_DISABLE: /* --disable */
     /* if used first, already taken care of, we do it like this so we do not

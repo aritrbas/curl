@@ -49,7 +49,6 @@
 #include "http1.h"
 #include "http_proxy.h"
 #include "select.h"
-#include "inet_pton.h"
 #include "uint-hash.h"
 #include "vquic/vquic.h"
 #include "vquic/vquic_int.h"
@@ -3264,7 +3263,7 @@ static int Curl_get_QUIC_addr_info(struct Curl_cfilter *cf,
                                    struct Curl_addrinfo *ai)
 {
   struct connectdata *conn = cf->conn;
-  struct Curl_dns_entry *remotehost = conn->dns_entry;
+  struct Curl_dns_entry *remotehost = data->state.dns[cf->sockindex];
   int ai_family0 = 0, ai_family1 = 0;
   const struct Curl_addrinfo *addr0 = NULL, *addr1 = NULL;
 

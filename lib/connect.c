@@ -1379,7 +1379,7 @@ connect_sub_chain:
      need the next filter to be QUIC/HTTP/3 (which has SSL) */
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ctx->state < CF_SETUP_CNNCT_SSL) {
-      result = Curl_cf_quic_insert_after(cf, data, ctx->remotehost);
+      result = Curl_cf_quic_insert_after(cf, data, dns);
       if(result)
         return result;
       ctx->state = CF_SETUP_CNNCT_SSL;
