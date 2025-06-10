@@ -24,8 +24,7 @@
 
 #include "curl_setup.h"
 
-/* #if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY) */
-#if 1
+#if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY)
 
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
@@ -716,10 +715,6 @@ struct h3_stream_ctx
   curl_uint64_t error3;         /* HTTP/3 stream error code */
   curl_off_t upload_left;       /* number of request bytes left to upload */
   curl_off_t tun_data_recvd;    /* number of bytes received over tunnel */
-  curl_off_t tun_data_buffered; /* number of bytes sent over tunnel */
-  bool split_data;
-  int nwritten;
-  int last_data;
   int status_code;              /* HTTP status code */
   bool resp_hds_complete;       /* we have a complete, final response */
   bool closed;                  /* TRUE on stream close */
@@ -771,10 +766,6 @@ static CURLcode h3_data_setup(struct Curl_cfilter *cf,
    * headers to it that are not counted against the nghttp3 flow limits. */
   Curl_bufq_initp(&stream->recvbuf, &ctx->stream_bufcp,
                   PROXY_H3_STREAM_RECV_CHUNKS, BUFQ_OPT_SOFT_LIMIT);
-  stream->tun_data_buffered = 0;
-  stream->last_data = 0;
-  stream->nwritten = 0;
-  stream->split_data = FALSE;
 
   if(!Curl_uint_hash_set(&ctx->streams, data->mid, stream)) {
     h3_stream_ctx_free(stream);
@@ -869,6 +860,11 @@ static int cb_h3_stream_close(nghttp3_conn *conn, int64_t stream_id,
   return 0;
 }
 
+#define TMP_BUF_SIZE (size_t) 32768
+static uint32_t head = 0;
+static uint32_t tail = 0;
+static char tmp_buf[TMP_BUF_SIZE] = {0};
+
 static int handle_buffered_data(struct cf_osslq_stream *s,
                                 struct Curl_cfilter *cf,
                                 struct Curl_easy *data)
@@ -876,32 +872,39 @@ static int handle_buffered_data(struct cf_osslq_stream *s,
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   struct h3_stream_ctx *stream = H3_STREAM_CTX(ctx, data);
-  const unsigned char *buf;
-  size_t buflen;
   ssize_t nwritten;
+  int data_len;
   CURLcode result;
 
   if(!stream)
     return NGHTTP3_ERR_CALLBACK_FAILURE;
 
-  Curl_bufq_peek(&s->recvbuf, &buf, &buflen);
-  nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
-  /* MASQUE FIX: Remove this later */
-  /* infof(data, "[handle_buffered_data.......] "
-              "stream ID %zd, buflen=%zu, nwritten = %zd",
-        s->id, buflen, nwritten); */
+  data_len = tail - head;
+
+  nwritten = Curl_bufq_write(&proxy_ctx->inbufq, tmp_buf + head,
+                                              data_len, &result);
+  infof(data, "[handle_buffered_data.......] "
+              "stream ID %zd, data_len=%d, head=%d, tail=%d",
+        s->id, data_len, head, tail);
 
   if(nwritten < 0) {
-    stream->tun_data_buffered = (curl_off_t)(buflen);
+    infof(data, "[ABASU TEST] nwritten returned < 0 in handle_buffered_data");
   }
-  else if(nwritten < buflen) {
-    Curl_bufq_skip(&s->recvbuf, nwritten);
-    stream->tun_data_buffered = (curl_off_t)(buflen - nwritten);
+  else if(nwritten < data_len) {
+    head += nwritten;
+    data_len = tail - head + 1;
+    infof(data, "[ABASU TEST] nwritten = %zd, data_len = %d, "
+                "head = %d, tail = %d",
+                nwritten, data_len, head, tail);
   }
   else {
-    Curl_bufq_skip(&s->recvbuf, buflen);
     proxy_ctx->partial_read = FALSE;
-    stream->tun_data_buffered = 0;
+    head = 0;
+    tail = 0;
+    memset(tmp_buf, 0, TMP_BUF_SIZE);
+    infof(data, "[ABASU TEST] nwritten = %zd, data_len = %d, "
+                "head = %d, tail = %d",
+                nwritten, data_len, head, tail);
   }
   return 0;
 }
@@ -926,42 +929,36 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
 
-  /* MASQUE FIX: Remove this later */
-  infof(data, "[cb_h3_recv_data.......] "
-      "stream ID %zd, buflen %zu", stream->s.id, buflen);
-
   stream->tun_data_recvd += (curl_off_t)buflen;
   CURL_TRC_CF(data, cf, "[cb_h3_recv_data] "
               "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
               stream->s.id, buflen, stream->tun_data_recvd);
-  /* MASQUE FIX: Remove this later */
-  /*   infof(data, "[cb_h3_recv_data] "
-                "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
-                stream->s.id, buflen, stream->tun_data_recvd); */
+  infof(data, "[cb_h3_recv_data] "
+              "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
+              stream->s.id, buflen, stream->tun_data_recvd);
 
   if(proxy_ctx->partial_read) {
-    infof(data, "[BIG ISSUE] partial data?");
-    stream->split_data = TRUE;
-    stream->nwritten = nwritten > 0 ? nwritten : 0;
-    stream->last_data = buflen;
+    memcpy(tmp_buf + tail, buf, buflen);
+    tail += buflen;
     return 0;
   }
 
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
-  infof(data, "[cb_h3_recv_data] total len %u",
-        Curl_bufq_len(&proxy_ctx->inbufq));
+  infof(data, "[cb_h3_recv_data] inbufq data len = %u, "
+              "nwritten=%zd, buflen=%zu",
+              Curl_bufq_len(&proxy_ctx->inbufq), nwritten, buflen);
   if(nwritten < 0) {
-    /* MASQUE FIX: Remove this later */
-    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
+    infof(data, "[ABASU TEST] setting partial read to TRUE 1");
     proxy_ctx->partial_read = TRUE;
-    stream->tun_data_buffered = (curl_off_t)(buflen);
+    memcpy(tmp_buf + tail, buf, buflen);
+    tail += buflen;
     return 0;
   }
   else if(nwritten < buflen) {
-    /* MASQUE FIX: Remove this later */
-    infof(data, "[BIG ISSUE] nwritten returned %zd bytes", nwritten);
+    infof(data, "[ABASU TEST] setting partial read to TRUE 2");
     proxy_ctx->partial_read = TRUE;
-    stream->tun_data_buffered = (curl_off_t)(buflen - nwritten);
+    memcpy(tmp_buf + tail, buf + nwritten, (buflen - nwritten));
+    tail += (buflen - nwritten);
     return 0;
   }
 
@@ -1325,6 +1322,8 @@ static ssize_t h3_quic_recv(void *reader_ctx,
   size_t nread;
   int rv;
 
+  if(x->s->id == 0)
+    infof(x->data, "[h3_quic_recv] stream %ld", x->s->id);
   *err = CURLE_OK;
   rv = SSL_read_ex(x->s->ssl, buf, len, &nread);
   if(rv <= 0) {
@@ -1364,6 +1363,8 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
                                      struct Curl_cfilter *cf,
                                      struct Curl_easy *data)
 {
+  if(s->id == 0)
+    infof(data, "[cf_osslq_stream_recv] stream %ld", s->id);
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -1392,17 +1393,18 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
       while(!eagain && !s->recvd_eos && !Curl_bufq_is_full(&s->recvbuf)) {
         nread = Curl_bufq_sipn(&s->recvbuf, 0, h3_quic_recv, &x, &result);
         if(nread < 0) {
-           /* MASQUE FIX: Remove this later */
-           /* infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
-               s->id, result); */
-          if(result != CURLE_AGAIN)
+          if(result != CURLE_AGAIN) {
+            /* MASQUE FIX: Remove this later */
+            infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
+               s->id, result);
             goto out;
+          }
           result = CURLE_OK;
           eagain = TRUE;
         }
         else {
           /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Stream %ld read %ld bytes",
+          infof(data, "[cf_osslq_stream_recv] Stream %ld read nread=%ld bytes",
                s->id, nread);
         }
       }
@@ -1456,65 +1458,18 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
           goto out;
         }
 
-         CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] stream %ld, received %zd "
+        CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] stream %ld, received %zd "
                       "bytes, DATA bytes = %zu, forwarded to nghttp3 = %zd",
                       s->id, s->id, blen, (blen - nread), nread);
         /* MASQUE FIX: Remove this later */
-         /* infof(data, "[cf_osslq_stream_recv] stream %ld, received %d
-             bytes, " "DATA bytes = %zu, forwarded to nghttp3 = %zd", s->id,
-             blen, (blen - nread), nread); */
+        infof(data, "[cf_osslq_stream_recv] stream %ld, received %d "
+             "bytes, " "DATA bytes = %zu, forwarded to nghttp3 = %zd", s->id,
+             blen, (blen - nread), nread);
 
-         if(proxy_ctx->partial_read) {
-           /* MASQUE FIX: Remove this later */
-           /* infof(data, "[cf_osslq_stream_recv] buffer read
-              pending %zd bytes", stream->tun_data_buffered); */
-
-           if(stream->split_data) {
-             int len = Curl_bufq_len(&s->recvbuf);
-             char *temp = malloc(len);
-
-             Curl_bufq_read(&s->recvbuf, (unsigned char *)temp, len,
-                             &result);
-             Curl_bufq_reset(&s->recvbuf);
-
-             Curl_bufq_write(&s->recvbuf,
-                              (unsigned char *)temp + stream->nwritten,
-                              stream->tun_data_buffered, &result);
-             Curl_bufq_write(&s->recvbuf,
-                              (unsigned char *)temp + stream->nwritten
-                                  + stream->tun_data_buffered + nread,
-                              stream->last_data, &result);
-
-             free(temp);
-             total_recv_len += (stream->nwritten + nread);
-             stream->tun_data_buffered = 0;
-             stream->last_data = 0;
-             stream->nwritten = 0;
-             stream->split_data = FALSE;
-             /* MASQUE FIX: Remove this later */
-             /* infof(data, "[cf_osslq_stream_recv]
-                Reset stream->recvbuf, pending" " data in recvbuf = %zd ",
-                                              Curl_bufq_len(&s->recvbuf));
-              */
-             break;
-           }
-
-           blen -= stream->tun_data_buffered;
-           Curl_bufq_skip(&s->recvbuf, blen);
-           total_recv_len += blen;
-           /* MASQUE FIX: Remove this later */
-           /* infof(data, "[cf_osslq_stream_recv] Clear
-              recvbuf by %zu bytes," " pending data in stream recvbuf %zd ",
-              blen, Curl_bufq_len(&s->recvbuf)); */
-           break;
-           }
-
-        /* success, `nread` is the flow for QUIC to count as "consumed",
-         * not sure how that will work with OpenSSL. Anyways, without error,
-         * all data that we passed is not owned by nghttp3. */
         Curl_bufq_skip(&s->recvbuf, blen);
         total_recv_len += blen;
-        if(Curl_bufq_is_empty(&s->recvbuf)) {
+
+        if(Curl_bufq_is_empty(&s->recvbuf) || proxy_ctx->partial_read) {
           /* MASQUE FIX: Remove this later */
           /* infof(data, "[cf_osslq_stream_recv] Clear recvbuf by %zu
              bytes, " "all data in buffer processed", blen); */
@@ -1560,7 +1515,7 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
   }
 out:
   if(result)
-    CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] cf_osslq_stream_recv -> %d",
+    infof(data, "[%" FMT_PRId64 "] cf_osslq_stream_recv -> %d",
                 s->id, result);
   return result;
 }
@@ -1801,8 +1756,8 @@ static CURLcode h3_send_streams(struct Curl_cfilter *cf,
         infof(data, "[cf_h3_proxy_send] len == 3, "); */
     }
 
-    infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC stream %d",
-           s->id, total_len, stream_id);
+/*     infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC stream %d",
+           s->id, total_len, stream_id); */
     for(i = 0; (i < n) && !blocked; ++i) {
       /* Without stream->s.ssl, we closed that already, so
        * pretend the write did succeed. */
@@ -2212,7 +2167,7 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
   struct cf_call_data save;
   CURLcode result;
 
-  infof(data, "[cf_h3_proxy_recv] called, len=%zu", len);
+  /* infof(data, "[cf_h3_proxy_recv] called, len=%zu", len); */
   if(proxy_ctx->tunnel.closed)
     return nread;
 
@@ -2234,7 +2189,7 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
       nread = Curl_bufq_read(&proxy_ctx->inbufq,
                               (unsigned char *)buf, len, err);
       if(nread < 0) {
-        CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] read recvbuf(len=%zu) "
+        infof(data, "[%" FMT_PRId64 "] read recvbuf(len=%zu) "
                                 "-> %zd, %d",
                         stream->s.id, len, nread, *err);
         goto out;
