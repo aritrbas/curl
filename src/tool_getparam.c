@@ -2767,8 +2767,13 @@ static ParameterError opt_filestring(struct GlobalConfig *global,
   case C_PROXY: /* --proxy */
     /* --proxy */
     err = getstr(&config->proxy, nextarg, ALLOW_BLANK);
-    if(config->proxyver != CURLPROXY_HTTPS2)
+    if(config->proxyver != CURLPROXY_HTTPS2 &&
+                config->proxyver != CURLPROXY_HTTPS3)
       config->proxyver = CURLPROXY_HTTP;
+    else if(config->proxyver != CURLPROXY_HTTPS3)
+      config->proxyver = CURLPROXY_HTTPS2;
+    else
+      config->proxyver = CURLPROXY_HTTPS3;
     break;
   case C_REQUEST: /* --request */
     /* set custom request */
