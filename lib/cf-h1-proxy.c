@@ -41,6 +41,7 @@
 #include "cf-h1-proxy.h"
 #include "connect.h"
 #include "curl_trc.h"
+#include "bufq.h"
 #include "strcase.h"
 #include "vtls/vtls.h"
 #include "transfer.h"
@@ -52,6 +53,9 @@
 #include "curl_memory.h"
 #include "memdebug.h"
 
+#define PROXY_H1_CHUNK_SIZE     (16*1024)
+#define H1_TUNNEL_WINDOW_SIZE   (10 * 1024 * 1024)
+#define PROXY_H1_NW_RECV_CHUNKS (H1_TUNNEL_WINDOW_SIZE / PROXY_H1_CHUNK_SIZE)
 
 typedef enum {
     H1_TUNNEL_INIT,     /* init/default/no tunnel state */
@@ -66,6 +70,7 @@ typedef enum {
 struct h1_tunnel_state {
   struct dynbuf rcvbuf;
   struct dynbuf request_data;
+  struct bufq recvbuf;  /* UDP capsule receive buffer */
   size_t nsent;
   size_t headerlines;
   struct Curl_chunker ch;
@@ -100,6 +105,7 @@ static CURLcode tunnel_reinit(struct Curl_cfilter *cf,
   DEBUGASSERT(ts);
   curlx_dyn_reset(&ts->rcvbuf);
   curlx_dyn_reset(&ts->request_data);
+  Curl_bufq_reset(&ts->recvbuf);
   ts->tunnel_state = H1_TUNNEL_INIT;
   ts->keepon = KEEPON_CONNECT;
   ts->cl = 0;
@@ -126,6 +132,8 @@ static CURLcode tunnel_init(struct Curl_cfilter *cf,
 
   curlx_dyn_init(&ts->rcvbuf, DYN_PROXY_CONNECT_HEADERS);
   curlx_dyn_init(&ts->request_data, DYN_HTTP_REQUEST);
+  Curl_bufq_init2(&ts->recvbuf, PROXY_H1_CHUNK_SIZE, PROXY_H1_NW_RECV_CHUNKS,
+                  BUFQ_OPT_SOFT_LIMIT);
   Curl_httpchunk_init(data, &ts->ch, TRUE);
 
   *pts =  ts;
@@ -200,6 +208,7 @@ static void tunnel_free(struct Curl_cfilter *cf,
       h1_tunnel_go_state(cf, ts, H1_TUNNEL_FAILED, data);
       curlx_dyn_free(&ts->rcvbuf);
       curlx_dyn_free(&ts->request_data);
+      Curl_bufq_free(&ts->recvbuf);
       Curl_httpchunk_free(data, &ts->ch);
       free(ts);
       cf->ctx = NULL;
@@ -764,7 +773,10 @@ out:
     Curl_pgrsSetUploadCounter(data, 0);
     Curl_pgrsSetDownloadCounter(data, 0);
 
-    tunnel_free(cf, data);
+    /* For UDP tunnel proxy, keep the tunnel state for ongoing operations */
+    if(!cf->conn->bits.udp_tunnel_proxy) {
+      tunnel_free(cf, data);
+    }
   }
   return result;
 }
@@ -809,6 +821,10 @@ static void cf_h1_proxy_close(struct Curl_cfilter *cf,
     cf->connected = FALSE;
     if(cf->ctx) {
       h1_tunnel_go_state(cf, cf->ctx, H1_TUNNEL_INIT, data);
+      /* For UDP tunnel proxy, free the tunnel state on close */
+      if(cf->conn->bits.udp_tunnel_proxy) {
+        tunnel_free(cf, data);
+      }
     }
     if(cf->next)
       cf->next->cft->do_close(cf->next, data);
@@ -911,21 +927,11 @@ cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   return rv;
 }
 
-static uint8_t
-http_var_length_bytes(char *start)
-{
-  uint8_t first_byte = *start;
+#define HTTP_INVALID_VARINT             ((uint64_t) ~0)
+#define HTTP_CAPSULE_HEADER_MAX_SIZE    10
 
-  /* Check the first 2 bits */
-  if((first_byte & 0xC0) == 0x00) /* 00xxxxxx */
-    return 1;
-  else if((first_byte & 0xC0) == 0x40) /* 01xxxxxx */
-    return 2;
-  else if((first_byte & 0xC0) == 0x80) /* 10xxxxxx */
-    return 4;
-  else /* 11xxxxxx */
-    return 8;
-}
+# define BIO_MSG_N(array, stride, n) \
+  (*(BIO_MSG *)((char *)(array) + (n)*(stride)))
 
 static uint64_t
 http_decode_varint(char **start)
@@ -959,380 +965,180 @@ http_decode_varint(char **start)
   return value;
 }
 
-#define TMP_BUF_SIZE (size_t) 131072
-static uint64_t head = 0;
-static uint64_t tail = 0;
-static char tmp_buf[TMP_BUF_SIZE] = {0};
-/* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
-static uint64_t written = 0;
-static uint64_t received = 0;
+struct cf_h1_proxy_reader_ctx {
+  struct Curl_cfilter *cf;
+  struct Curl_easy *data;
+};
 
-# define BIO_MSG_N(array, stride, n) \
-  (*(BIO_MSG *)((char *)(array) + (n)*(stride)))
+static ssize_t proxy_nw_in_reader(void *reader_ctx,
+                               unsigned char *buf, size_t buflen,
+                               CURLcode *err)
+{
+  struct cf_h1_proxy_reader_ctx *rctx = reader_ctx;
+  ssize_t nread;
 
-/* Add data to the circular queue, handling wrapping if needed */
-static CURLcode
-add_to_circular_queue(struct Curl_easy *data,
-                      char *buf, size_t stride, uint8_t idx)
+  nread = rctx->cf->next->cft->do_recv(rctx->cf->next, rctx->data,
+                                       (char *)buf, buflen, err);
+  return nread;
+}
+
+static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
+                                   struct Curl_easy *data,
+                                   struct h1_tunnel_state *ts,
+                                   char *buf, size_t len, CURLcode *err)
 {
   BIO_MSG *my_bio = (BIO_MSG *)buf;
-  char *stream_data;
-  size_t stream_data_len;
-  size_t avail_bytes;
-  size_t first_chunk;
-  size_t second_chunk;
-
-  /* Calculate remaining space in tmp_buf */
-  avail_bytes = (head <= tail) ? (TMP_BUF_SIZE - tail + head) : (head - tail);
-
-  stream_data = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
-  stream_data_len = (size_t)(BIO_MSG_N(my_bio, stride, idx).data_len);
-  /* infof(data, "MASQUE FIX %lld stream data len received",
-              stream_data_len); */
-
-  if(stream_data_len > avail_bytes) {
-    /* Ideally we should not be hitting this case */
-    infof(data, "Buffer overflow - not enough space in circular buffer");
-    infof(data, "Buffer overflow - head=%ld, tail=%ld, stream_data_len=%ld",
-                            head, tail, stream_data_len);
-    abort();
-    return CURLE_TOO_LARGE;
-  }
-
-  /* Copy data into circular queue */
-  if(tail + stream_data_len <= TMP_BUF_SIZE) {
-    /* Continuous copy */
-    memcpy(tmp_buf + tail, stream_data, stream_data_len);
-    tail += stream_data_len;
-    if(tail == TMP_BUF_SIZE)
-      tail = 0;
-  }
-  else {
-    /* Split copy into circular queue */
-    first_chunk = TMP_BUF_SIZE - tail;
-    second_chunk = stream_data_len - first_chunk;
-    memcpy(tmp_buf + tail, stream_data, first_chunk);
-    memcpy(tmp_buf, stream_data + first_chunk, second_chunk);
-    tail = second_chunk;
-  }
-  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
-  received += stream_data_len;
-
-  return CURLE_OK;
-}
-
-/* | <empty> | <data> | <empty> */
-/*         head      tail       */
-/* ..............OR............ */
-/* | <data> | <empty> | <data>  */
-/*         tail      head       */
-
-static CURLcode
-process_chunked_capsules(struct Curl_easy *data,
-                         char *buf, size_t stride, size_t idx)
-{
-  size_t avail_bytes;
-  size_t unwrapped_bytes;
-  char chunk_size[4] = {0};
-  char *chunk_size_ptr = chunk_size;
-  char temp[8] = {0};
-  char *decode;
-  char *capsule_start;
-  uint64_t ptr = head;
-  uint8_t index = 0;
-  uint8_t chunk_size_bytes = 0;
-  curl_off_t chunk_len;
-  size_t var_enc_bytes;
-  uint64_t capsule_length;
-  size_t bytes_to_copy;
-
-  BIO_MSG *my_bio = (BIO_MSG*)buf;
-  char *dgram = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
-
-  avail_bytes = (tail >= head) ? (tail - head) : (TMP_BUF_SIZE - head + tail);
-  /* infof(data, "[%d] Avail Bytes = %lld", idx, avail_bytes); */
-  if(avail_bytes < 8)
-    goto out;
-
-  while(tmp_buf[ptr % TMP_BUF_SIZE] != '\r' &&
-          tmp_buf[(ptr + 1) % TMP_BUF_SIZE] != '\n') {
-    chunk_size[index++] = tmp_buf[ptr % TMP_BUF_SIZE];
-    ptr++;
-    if(index == 4) {
-      infof(data, "Error! Invalid chunk length bytes");
-      goto out;
-    }
-  }
-  ptr++;
-  ptr++;
-  /* --> At this point, "ptr" is pointing at the beginning of the capsule */
-
-  curlx_str_hex(&chunk_size_ptr, &chunk_len, 0xFFFF);
-  if(chunk_len == 0) {
-    infof(data, "Error! Invalid chunk length");
-    goto out;
-  }
-  /* Cannot process capsule since we do not have enough bytes */
-  if((chunk_len + 2) > (avail_bytes - index - 2))
-    goto out;
-
-  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
-    infof(data, "Error! Invalid capsule start byte: %02x",
-          tmp_buf[ptr % TMP_BUF_SIZE]);
-    goto out;
-  }
-  ptr++;
-  /* --> At this point, "ptr" is pointing at beginning of var_enc_bytes */
-
-  /* chunk_len bytes + "\r\n" (2 bytes) + "0x00" (1 byte) */
-  avail_bytes = avail_bytes - index - 3;
-
-  decode = tmp_buf + (ptr % TMP_BUF_SIZE);
-  var_enc_bytes = http_var_length_bytes(decode);
-
-  chunk_size_bytes = index;
-  index = 0;
-  while(index < var_enc_bytes) {
-    temp[index] = tmp_buf[ptr % TMP_BUF_SIZE];
-    ptr++;
-    index++;
-  }
-  /* --> At this point, "ptr" is pointing at context ID */
-
-  decode = &temp[0];
-  capsule_length = http_decode_varint(&decode);
-
-  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
-    infof(data, "Error! Invalid context ID: %02x",
-          tmp_buf[ptr % TMP_BUF_SIZE]);
-    goto out;
-  }
-  ptr++;
-  capsule_length--;
-  /* --> At this point, "ptr" is pointing at beginning of capsule */
-
-  if(tmp_buf[(ptr + capsule_length) % TMP_BUF_SIZE]!= '\r' &&
-      tmp_buf[(ptr + capsule_length + 1) % TMP_BUF_SIZE] != '\n') {
-      infof(data, "MASQUE FIX [%ld] Incomplete chunk received, bailing", idx);
-      goto out;
-  }
-
-  /* var_enc bytes +  "0x00" (1 byte) */
-  avail_bytes = avail_bytes - var_enc_bytes - 1;
-
-  if(avail_bytes < capsule_length + 2) {
-    infof(data, "MASQUE FIX [%ld] Incomplete capsule received, bailing", idx);
-    goto out;
-  }
-
-  head = ptr % TMP_BUF_SIZE;
-  unwrapped_bytes = (head < tail) ? (tail - head) : (TMP_BUF_SIZE - head);
-
-  capsule_start = tmp_buf + head;
-  /* Copy payload, handling wrap if needed */
-  if(unwrapped_bytes >= capsule_length) {
-    /* Continuous copy */
-    memcpy(dgram, capsule_start, capsule_length);
-  }
-  else {
-    /* Split circular copy */
-    bytes_to_copy = TMP_BUF_SIZE - head;
-    memcpy(dgram, capsule_start, bytes_to_copy);
-    memcpy(dgram + bytes_to_copy, tmp_buf,
-            capsule_length - bytes_to_copy);
-  }
-
-  BIO_MSG_N(my_bio, stride, idx).data_len = capsule_length;
-  /* infof(data, "MASQUE FIX %lld dgram filled", capsule_length); */
-
-  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
-  written += 2 + chunk_size_bytes + 1 + var_enc_bytes + 1 + capsule_length + 2;
-
-  /* Update head */
-  head = head + capsule_length + 2;
-  if(head >= TMP_BUF_SIZE)
-    head -= TMP_BUF_SIZE;
-
-  infof(data, "MASQUE FIX [%ld] process_chunked_capsules "
-    "head=%ld, tail=%ld", idx, head, tail);
-
-  return CURLE_OK;
-
-out:
-  return CURLE_RECV_ERROR;
-}
-
-static CURLcode
-process_capsules(struct Curl_easy *data,
-                 char *buf, size_t stride, size_t idx)
-{
-  size_t avail_bytes;
-  size_t unwrapped_bytes;
-  char temp[8] = {0};
-  char *decode;
-  char *capsule_start;
-  uint64_t ptr = head;
-  uint8_t index = 0;
-  size_t var_enc_bytes;
-  uint64_t capsule_length;
-  size_t bytes_to_copy;
-
-  BIO_MSG *my_bio = (BIO_MSG*)buf;
-  char *dgram = (char *)(BIO_MSG_N(my_bio, stride, idx).data);
-
-  avail_bytes = (tail >= head) ? (tail - head) : (TMP_BUF_SIZE - head + tail);
-  /* infof(data, "[%d] Avail Bytes = %lld", idx, avail_bytes); */
-  if(avail_bytes < 3)
-    goto out;
-
-  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
-    infof(data, "Error! Invalid capsule start byte: %02x",
-          tmp_buf[ptr % TMP_BUF_SIZE]);
-    goto out;
-  }
-  ptr++;
-  /* --> At this point, "ptr" is pointing at beginning of var_enc_bytes */
-
-  /* "0x00" (1 byte) */
-  avail_bytes--;
-
-  decode = tmp_buf + (ptr % TMP_BUF_SIZE);
-  var_enc_bytes = http_var_length_bytes(decode);
-
-  index = 0;
-  while(index < var_enc_bytes) {
-    temp[index] = tmp_buf[ptr % TMP_BUF_SIZE];
-    ptr++;
-    index++;
-  }
-  /* --> At this point, "ptr" is pointing at context ID */
-
-  decode = &temp[0];
-  capsule_length = http_decode_varint(&decode);
-
-  if(tmp_buf[ptr % TMP_BUF_SIZE] != 0x00) {
-    infof(data, "Error! Invalid context ID: %02x",
-          tmp_buf[ptr % TMP_BUF_SIZE]);
-    goto out;
-  }
-  ptr++;
-  capsule_length--;
-  /* --> At this point, "ptr" is pointing at beginning of capsule */
-
-  /* var_enc bytes +  "0x00" (1 byte) */
-  avail_bytes = avail_bytes - var_enc_bytes - 1;
-
-  if(avail_bytes < capsule_length) {
-    infof(data, "MASQUE FIX [%ld] Incomplete capsule received, bailing", idx);
-    goto out;
-  }
-
-  head = ptr % TMP_BUF_SIZE;
-  unwrapped_bytes = (head < tail) ? (tail - head) : (TMP_BUF_SIZE - head);
-
-  capsule_start = tmp_buf + head;
-  /* Copy payload, handling wrap if needed */
-  if(unwrapped_bytes >= capsule_length) {
-    /* Continuous copy */
-    memcpy(dgram, capsule_start, capsule_length);
-  }
-  else {
-    /* Split circular copy */
-    bytes_to_copy = TMP_BUF_SIZE - head;
-    memcpy(dgram, capsule_start, bytes_to_copy);
-    memcpy(dgram + bytes_to_copy, tmp_buf,
-            capsule_length - bytes_to_copy);
-  }
-
-  BIO_MSG_N(my_bio, stride, idx).data_len = capsule_length;
-  /* infof(data, "MASQUE FIX %lld dgram filled", capsule_length); */
-
-  /* MASQUE FIX: DELETE, ONLY FOR DEBUGGING */
-  written += capsule_length + var_enc_bytes + 2;
-
-  /* Update head */
-  head = head + capsule_length;
-  if(head >= TMP_BUF_SIZE)
-    head -= TMP_BUF_SIZE;
-
-  /* infof(data, "MASQUE FIX [%ld] process_chunked_capsules "
-    "head=%ld, tail=%ld", idx, head, tail); */
-
-  return CURLE_OK;
-
-out:
-  return CURLE_RECV_ERROR;
-}
-
-static size_t
-decap_udp_payload_datagram2(struct Curl_easy *data,
-                            char *buf, uint8_t count,
-                            size_t stride)
-{
-  size_t idx;
   /* MASQUE FIX: how to get this value from OpenSSL code? */
   size_t num_msg = 32;
-  CURLcode res;
+  size_t stride = len;
+  uint8_t idx = 0;
+  ssize_t nread = -1;
+  ssize_t bytes_consumed = 0;
+  CURLcode result = CURLE_OK;
 
-  infof(data, "MASQUE FIX [%d] filled buf received from SSL", count);
+  /* Parse data in ts->recvbuf, which is formatted as udp capsules,
+     into BIO_MSG structures obtained from BIO_MSG_N (my_bio, stride, idx),
+     so that we can use the BIO_MSG API to read them.
+     The data is formatted as:
+     [capsule_type][varint_length][context_id][data] where capsule_type is 0
+     for HTTP Datagram, context_id is 0 for UDP Proxying Payload, and data is
+     the actual payload.
+  */
 
-  for(idx = 0; idx < count; idx++) {
-    /* append data from all the filled buffers in BIO_MSG to tmp_buf */
-    res = add_to_circular_queue(data, buf, stride, idx);
-    if(res != CURLE_OK)
+  /* Process available capsules from recvbuf until full or no more data */
+  while(idx < num_msg && !Curl_bufq_is_empty(&ts->recvbuf)) {
+    uint8_t *context_id, *capsule_type;
+    unsigned char *capsule_data;
+    unsigned char *temp_buf;
+    size_t read_size, temp_size = 0;
+    char *decode_ptr;
+    size_t offset = 0, capsule_length;
+
+    /* Read the capsule type (should be 0 for HTTP Datagram) */
+    if(!Curl_bufq_peek(&ts->recvbuf, &capsule_type, &read_size))
       break;
 
-    /* process capsules from circular buffer */
-    /* MASQUE FIX: envoy and h2o has different behaviour */
-    /* envoy sends chunked capsule, h2o just sends capsules */
-    /* res = process_chunked_capsules(data, buf, stride, idx); */
-    res = process_capsules(data, buf, stride, idx);
-    if(res != CURLE_OK)
+    if(capsule_type[0]) {
+      infof(data, "Error! Invalid capsule type: %zd", *capsule_type);
+      result = CURLE_RECV_ERROR;
       break;
+    }
+
+    offset += 1;
+
+    /* Read enough bytes to determine varint length
+     * NOTE handle spread over multiple chunks */
+    Curl_bufq_peek_at(&ts->recvbuf, offset,
+                      (const unsigned char **)&temp_buf, &temp_size);
+    if(temp_size < 1)
+      break;
+
+    /* Determine varint length */
+    decode_ptr = (char *)temp_buf;
+    capsule_length = http_decode_varint(&decode_ptr);
+
+    if(capsule_length == HTTP_INVALID_VARINT) {
+      infof(data, "Error! Invalid varint length encoding");
+      result = CURLE_RECV_ERROR;
+      break;
+    }
+
+    /* Skip over the varint in the actual buffer */
+    offset += (decode_ptr - (char *)temp_buf);
+
+    /* Read context ID (should be 0 for UDP Proxying Payload) */
+    if(!Curl_bufq_peek_at(&ts->recvbuf, offset, &context_id,
+                           &read_size))
+      break;
+
+    if(*context_id) {
+      infof(data, "Error! Invalid context ID: %02x", context_id);
+      result = CURLE_RECV_ERROR;
+      break;
+    }
+
+    /* Skip over the context ID */
+    offset += 1;
+
+    /* Adjust length (subtract context ID length) */
+    capsule_length--;
+    if(Curl_bufq_len(&ts->recvbuf) < offset + capsule_length) {
+      infof(data, "Error! Not enough data for capsule length: %zu",
+            capsule_length);
+      result = CURLE_OK;
+      break;
+    }
+
+    /* Get a pointer to the BIO_MSG data buffer */
+    capsule_data = (unsigned char *)BIO_MSG_N(my_bio, stride, idx).data;
+    size_t data_buf_size = BIO_MSG_N(my_bio, stride, idx).data_len;
+
+    if(data_buf_size < capsule_length) {
+      infof(data, "Error! Capsule too large: %zd", capsule_length);
+      result = CURLE_RECV_ERROR;
+      break;
+    }
+
+    Curl_bufq_skip(&ts->recvbuf, offset);
+    bytes_consumed += offset;
+
+    /* Read the actual payload data */
+    size_t bytes_read = Curl_bufq_read(&ts->recvbuf, capsule_data,
+                                       capsule_length, err);
+
+    if(bytes_read != capsule_length) {
+      infof(data, "Error! Read less than expected %zd %zd", capsule_length,
+            bytes_read);
+      result = CURLE_RECV_ERROR;
+      break;
+    }
+
+    /* Set the actual data length in the BIO_MSG structure */
+    BIO_MSG_N(my_bio, stride, idx).data_len = bytes_read;
+
+    bytes_consumed += bytes_read;
+
+    /* Move to the next message */
+    idx++;
+
+    infof(data, "Processed UDP capsule: size=%zu length_left %zu",
+          capsule_length, Curl_bufq_len(&ts->recvbuf));
   }
 
-  /* process capsules from circular buffer */
-  for(; idx < num_msg; idx++) {
-    /* MASQUE FIX: envoy and h2o has different behaviour */
-    /* envoy sends chunked capsule, h2o just sends capsules */
-    /* res = process_chunked_capsules(data, buf, stride, idx); */
-    res = process_capsules(data, buf, stride, idx);
-    if(res != CURLE_OK)
-      break;
-  }
-
-  infof(data, "MASQUE FIX [%ld] filled dgram sent to HTTP/3 QUIC", idx);
-  infof(data, "MASQUE FIX "
-              "head=%ld, tail=%ld, written=%ld, received=%ld",
-                                    head, tail, written, received);
-  return idx;
+  nread = idx ? idx : -1;
+  *err = CURLE_AGAIN;
+  return nread;
 }
 
 static ssize_t
 cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
                  char *buf, size_t len, CURLcode *err)
 {
-  int rv;
+  struct h1_tunnel_state *ts = cf->ctx;
+  ssize_t rv;
+
   if(!cf->next)
     return CURLE_RECV_ERROR;
 
   if(data->conn->bits.udp_tunnel_proxy) {
-    BIO_MSG *my_bio = (BIO_MSG*)buf;
-    /* MASQUE FIX: how to get this value from OpenSSL code? */
-    size_t num_msg = 32;
-    size_t stride = len;
-    uint8_t idx = 0;
-    for(idx = 0; idx < num_msg; idx++) {
-      rv = cf->next->cft->do_recv(cf->next, data,
-                          (char *)(BIO_MSG_N(my_bio, stride, idx).data),
-                          (size_t)(BIO_MSG_N(my_bio, stride, idx).data_len),
-                          err);
-      if(rv < 0)
-        break;
-      BIO_MSG_N(my_bio, stride, idx).data_len = rv;
+    /* For UDP tunnel proxy, we need to handle capsule processing */
+    if(!ts) {
+      *err = CURLE_RECV_ERROR;
+      return -1;
     }
-    if(idx > 0)
-      rv = decap_udp_payload_datagram2(data, (char *)my_bio, idx, stride);
+
+    /* First, try to read more data from the network into our recvbuf */
+    if(!Curl_bufq_is_full(&ts->recvbuf)) {
+      struct cf_h1_proxy_reader_ctx rctx = { cf, data };
+      ssize_t nread = Curl_bufq_slurp(&ts->recvbuf, proxy_nw_in_reader,
+                                      &rctx, err);
+      if(nread < 0 && *err != CURLE_AGAIN) {
+        return nread;
+      }
+    }
+
+    /* Now process capsules from recvbuf into BIO_MSG format */
+    rv = process_udp_capsule(cf, data, ts, buf, len, err);
   }
   else {
     rv = cf->next->cft->do_recv(cf->next, data, buf, len, err);
