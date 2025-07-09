@@ -144,6 +144,7 @@ LIB_CFILES =         \
   asyn-thrdd.c       \
   bufq.c             \
   bufref.c           \
+  capsule.c          \
   cf-h1-proxy.c      \
   cf-h2-proxy.c      \
   cf-h3-proxy.c      \
@@ -273,6 +274,7 @@ LIB_HFILES =         \
   asyn.h             \
   bufq.h             \
   bufref.h           \
+  capsule.h          \
   cf-h1-proxy.h      \
   cf-h2-proxy.h      \
   cf-h3-proxy.h      \

@@ -47,6 +47,7 @@
 #include "transfer.h"
 #include "multiif.h"
 #include "curlx/strparse.h"
+#include "capsule.h"
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
@@ -831,72 +832,11 @@ static void cf_h1_proxy_close(struct Curl_cfilter *cf,
   }
 }
 
-#define HTTP_INVALID_VARINT             ((uint64_t) ~0)
-#define HTTP_CAPSULE_HEADER_MAX_SIZE    10
-
-#define foreach_http_capsule_type _ (0, DATAGRAM)
-typedef enum http_capsule_type_
-{
-#define _(n, s) HTTP_CAPSULE_TYPE_##s = n,
-  foreach_http_capsule_type
-#undef _
-} __attribute__((packed)) http_capsule_type_t;
-
-static uint64_t
-custom_ntohll(uint64_t value)
-{
-  union {
-      uint64_t u64;
-      uint32_t u32[2];
-  } src, dst;
-
-  src.u64 = value;
-
-  dst.u32[0] = ntohl(src.u32[1]);
-  dst.u32[1] = ntohl(src.u32[0]);
-
-  return dst.u64;
-}
-
-static void
-http_encode_varint(struct dynbuf *dyn, uint64_t value)
-{
-  CURLcode result;
-  DEBUGASSERT(value <= 0x3FFFFFFFFFFFFFFF);
-
-  if(value <= 0x3F) {
-    uint8_t encoded;
-    encoded = (char)value;
-    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
-  }
-  else if(value <= 0x3FFF) {
-    /* Set bits 15-14 to "01", preserve lower 14 bits */
-    uint16_t encoded;
-    encoded = (uint16_t)value & 0x3FFF;
-    encoded = ntohs(encoded | 0x4000);
-    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
-  }
-  else if(value <= 0x3FFFFFFF) {
-    /* Set bits 31-30 to "10", preserve lower 30 bits */
-    uint32_t encoded;
-    encoded = (uint32_t)value & 0x3FFFFFFF;
-    encoded = ntohl(encoded | 0x80000000);
-    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
-  }
-  else {
-    /* Set bits 63-62 to "11", preserve lower 62 bits */
-    uint64_t encoded;
-    encoded = (uint64_t)value & 0x3FFFFFFFFFFFFFFF;
-    encoded = custom_ntohll(encoded | 0xC000000000000000);
-    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
-  }
-}
-
 static ssize_t
 cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                  const void *buf, size_t len, bool eos, CURLcode *err)
 {
-  int rv;
+  ssize_t rv;
   CURLcode result;
 
   if(!cf->next)
@@ -905,64 +845,21 @@ cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   if(data->conn->bits.udp_tunnel_proxy) {
     struct dynbuf dyn;
 
-    uint8_t cap_type = 0;
-    uint8_t ctx_id = 0;
+    result = curl_capsule_encap_udp_datagram(&dyn, buf, len);
+    if(result) {
+      *err = result;
+      return -1;
+    }
 
-    curlx_dyn_init(&dyn, HTTP_CAPSULE_HEADER_MAX_SIZE + len);
-
-    result = curlx_dyn_addn(&dyn, &cap_type, sizeof(cap_type));
-
-    http_encode_varint(&dyn, len + 1);
-
-    result = curlx_dyn_addn(&dyn, &ctx_id, sizeof(ctx_id));
-
-    result = curlx_dyn_addn(&dyn, buf, len);
-
-    rv = cf->next->cft->do_send(cf->next, data, dyn.bufr, dyn.leng, eos, err);
+    rv = cf->next->cft->do_send(cf->next, data, curlx_dyn_ptr(&dyn),
+                                curlx_dyn_len(&dyn), eos, err);
+    curlx_dyn_free(&dyn);
   }
   else {
     rv = cf->next->cft->do_send(cf->next, data, buf, len, eos, err);
   }
 
   return rv;
-}
-
-#define HTTP_INVALID_VARINT             ((uint64_t) ~0)
-#define HTTP_CAPSULE_HEADER_MAX_SIZE    10
-
-# define BIO_MSG_N(array, stride, n) \
-  (*(BIO_MSG *)((char *)(array) + (n)*(stride)))
-
-static uint64_t
-http_decode_varint(char **start)
-{
-  uint8_t first_byte;
-  uint8_t bytes_left;
-  uint64_t value;
-  char *pos;
-
-  pos = *start;
-  first_byte = *pos;
-  pos++;
-
-  if(first_byte <= 0x3F) {
-    *start = pos;
-    return first_byte;
-  }
-
-  /* remove length bits, encoded in the first two bits of the first byte */
-  value = first_byte & 0x3F;
-  bytes_left = (1 << (first_byte >> 6)) - 1;
-
-  do
-  {
-    value = (value << 8) | (uint8_t)(*pos);
-    pos++;
-  }
-  while(--bytes_left);
-
-  *start = pos;
-  return value;
 }
 
 struct cf_h1_proxy_reader_ctx {
@@ -979,134 +876,6 @@ static ssize_t proxy_nw_in_reader(void *reader_ctx,
 
   nread = rctx->cf->next->cft->do_recv(rctx->cf->next, rctx->data,
                                        (char *)buf, buflen, err);
-  return nread;
-}
-
-static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
-                                   struct Curl_easy *data,
-                                   struct h1_tunnel_state *ts,
-                                   char *buf, size_t len, CURLcode *err)
-{
-  BIO_MSG *my_bio = (BIO_MSG *)buf;
-  /* MASQUE FIX: how to get this value from OpenSSL code? */
-  size_t num_msg = 32;
-  size_t stride = len;
-  uint8_t idx = 0;
-  ssize_t nread = -1;
-  ssize_t bytes_consumed = 0;
-  CURLcode result = CURLE_OK;
-
-  /* Parse data in ts->recvbuf, which is formatted as udp capsules,
-     into BIO_MSG structures obtained from BIO_MSG_N (my_bio, stride, idx),
-     so that we can use the BIO_MSG API to read them.
-     The data is formatted as:
-     [capsule_type][varint_length][context_id][data] where capsule_type is 0
-     for HTTP Datagram, context_id is 0 for UDP Proxying Payload, and data is
-     the actual payload.
-  */
-
-  /* Process available capsules from recvbuf until full or no more data */
-  while(idx < num_msg && !Curl_bufq_is_empty(&ts->recvbuf)) {
-    uint8_t *context_id, *capsule_type;
-    unsigned char *capsule_data;
-    unsigned char *temp_buf;
-    size_t read_size, temp_size = 0;
-    char *decode_ptr;
-    size_t offset = 0, capsule_length;
-
-    /* Read the capsule type (should be 0 for HTTP Datagram) */
-    if(!Curl_bufq_peek(&ts->recvbuf, &capsule_type, &read_size))
-      break;
-
-    if(capsule_type[0]) {
-      infof(data, "Error! Invalid capsule type: %zd", *capsule_type);
-      result = CURLE_RECV_ERROR;
-      break;
-    }
-
-    offset += 1;
-
-    /* Read enough bytes to determine varint length
-     * NOTE handle spread over multiple chunks */
-    Curl_bufq_peek_at(&ts->recvbuf, offset,
-                      (const unsigned char **)&temp_buf, &temp_size);
-    if(temp_size < 1)
-      break;
-
-    /* Determine varint length */
-    decode_ptr = (char *)temp_buf;
-    capsule_length = http_decode_varint(&decode_ptr);
-
-    if(capsule_length == HTTP_INVALID_VARINT) {
-      infof(data, "Error! Invalid varint length encoding");
-      result = CURLE_RECV_ERROR;
-      break;
-    }
-
-    /* Skip over the varint in the actual buffer */
-    offset += (decode_ptr - (char *)temp_buf);
-
-    /* Read context ID (should be 0 for UDP Proxying Payload) */
-    if(!Curl_bufq_peek_at(&ts->recvbuf, offset, &context_id,
-                           &read_size))
-      break;
-
-    if(*context_id) {
-      infof(data, "Error! Invalid context ID: %02x", context_id);
-      result = CURLE_RECV_ERROR;
-      break;
-    }
-
-    /* Skip over the context ID */
-    offset += 1;
-
-    /* Adjust length (subtract context ID length) */
-    capsule_length--;
-    if(Curl_bufq_len(&ts->recvbuf) < offset + capsule_length) {
-      infof(data, "Error! Not enough data for capsule length: %zu",
-            capsule_length);
-      result = CURLE_OK;
-      break;
-    }
-
-    /* Get a pointer to the BIO_MSG data buffer */
-    capsule_data = (unsigned char *)BIO_MSG_N(my_bio, stride, idx).data;
-    size_t data_buf_size = BIO_MSG_N(my_bio, stride, idx).data_len;
-
-    if(data_buf_size < capsule_length) {
-      infof(data, "Error! Capsule too large: %zd", capsule_length);
-      result = CURLE_RECV_ERROR;
-      break;
-    }
-
-    Curl_bufq_skip(&ts->recvbuf, offset);
-    bytes_consumed += offset;
-
-    /* Read the actual payload data */
-    size_t bytes_read = Curl_bufq_read(&ts->recvbuf, capsule_data,
-                                       capsule_length, err);
-
-    if(bytes_read != capsule_length) {
-      infof(data, "Error! Read less than expected %zd %zd", capsule_length,
-            bytes_read);
-      result = CURLE_RECV_ERROR;
-      break;
-    }
-
-    /* Set the actual data length in the BIO_MSG structure */
-    BIO_MSG_N(my_bio, stride, idx).data_len = bytes_read;
-
-    bytes_consumed += bytes_read;
-
-    /* Move to the next message */
-    idx++;
-
-    infof(data, "Processed UDP capsule: size=%zu length_left %zu",
-          capsule_length, Curl_bufq_len(&ts->recvbuf));
-  }
-
-  nread = idx ? idx : -1;
-  *err = CURLE_AGAIN;
   return nread;
 }
 
@@ -1138,7 +907,7 @@ cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
     }
 
     /* Now process capsules from recvbuf into BIO_MSG format */
-    rv = process_udp_capsule(cf, data, ts, buf, len, err);
+    rv = curl_capsule_process_udp(cf, data, &ts->recvbuf, buf, len, err);
   }
   else {
     rv = cf->next->cft->do_recv(cf->next, data, buf, len, err);
