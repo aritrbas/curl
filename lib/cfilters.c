@@ -101,9 +101,8 @@ ssize_t  Curl_cf_def_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                           const void *buf, size_t len, bool eos,
                           CURLcode *err)
 {
-  return cf->next ?
-    cf->next->cft->do_send(cf->next, data, buf, len, eos, err) :
-    CURLE_RECV_ERROR;
+  return cf->next ? cf->next->cft->do_send(cf->next,
+             data, buf, len, eos, err) : CURLE_RECV_ERROR;
 }
 
 ssize_t  Curl_cf_def_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
@@ -385,8 +384,13 @@ ssize_t Curl_conn_cf_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                           const void *buf, size_t len, bool eos,
                           CURLcode *err)
 {
-  if(cf)
+  if(cf) {
+    /*
+    if(cf->cft == &Curl_cft_http_proxy && data->conn->bits.udp_tunnel_proxy)
+      encap_udp_payload_datagram(data, buf, &len);
+    */
     return cf->cft->do_send(cf, data, buf, len, eos, err);
+  }
   *err = CURLE_SEND_ERROR;
   return -1;
 }
@@ -394,8 +398,13 @@ ssize_t Curl_conn_cf_send(struct Curl_cfilter *cf, struct Curl_easy *data,
 ssize_t Curl_conn_cf_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
                           char *buf, size_t len, CURLcode *err)
 {
-  if(cf)
+  if(cf) {
+    /*
+    if(cf->cft == &Curl_cft_http_proxy && data->conn->bits.udp_tunnel_proxy)
+      decap_udp_payload_datagram(data, buf, len);
+    */
     return cf->cft->do_recv(cf, data, buf, len, err);
+  }
   *err = CURLE_RECV_ERROR;
   return -1;
 }

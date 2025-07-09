@@ -750,6 +750,13 @@ static CURLcode setopt_long(struct Curl_easy *data, CURLoption option,
     data->set.tunnel_thru_httpproxy = enabled;
     break;
 
+  case CURLOPT_HTTPPROXYUDPTUNNEL:
+    /*
+     * Tunnel operations through the proxy instead of normal proxy use
+     */
+    data->set.tunnel_thru_httpproxy_udp = enabled;
+    break;
+
   case CURLOPT_PROXYPORT:
     /*
      * Explicitly set HTTP proxy port number.
