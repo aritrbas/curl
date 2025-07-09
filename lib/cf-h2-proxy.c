@@ -26,6 +26,7 @@
 
 #if defined(USE_NGHTTP2) && !defined(CURL_DISABLE_PROXY)
 
+#include <openssl/bio.h>
 #include <nghttp2/nghttp2.h>
 #include "urldata.h"
 #include "url.h"
@@ -41,6 +42,7 @@
 #include "multiif.h"
 #include "sendf.h"
 #include "cf-h2-proxy.h"
+#include "capsule.h"
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
@@ -154,7 +156,12 @@ static void h2_tunnel_go_state(struct Curl_cfilter *cf,
   case H2_TUNNEL_ESTABLISHED:
     CURL_TRC_CF(data, cf, "[%d] new tunnel state 'established'",
                 ts->stream_id);
-    infof(data, "CONNECT phase completed");
+    if(cf->conn->bits.udp_tunnel_proxy) {
+      infof(data, "CONNECT-UDP phase completed for HTTP/2 proxy");
+    }
+    else {
+      infof(data, "CONNECT phase completed for HTTP/2 proxy");
+    }
     data->state.authproxy.done = TRUE;
     data->state.authproxy.multipass = FALSE;
     FALLTHROUGH();
@@ -934,14 +941,23 @@ static CURLcode submit_CONNECT(struct Curl_cfilter *cf,
   CURLcode result;
   struct httpreq *req = NULL;
 
-  result = Curl_http_proxy_create_CONNECT(&req, cf, data, 2);
+  if(cf->conn->bits.udp_tunnel_proxy) {
+    result = Curl_http_proxy_create_CONNECTUDP(&req, cf, data, 2);
+  }
+  else {
+    result = Curl_http_proxy_create_CONNECT(&req, cf, data, 2);
+  }
   if(result)
     goto out;
   result = Curl_creader_set_null(data);
   if(result)
     goto out;
 
-  infof(data, "Establish HTTP/2 proxy tunnel to %s", req->authority);
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "Establishing HTTP/2 proxy UDP tunnel to %s:%s",
+                        data->state.up.hostname, data->state.up.port);
+  else
+    infof(data, "Establishing HTTP/2 proxy tunnel to %s", req->authority);
 
   result = proxy_h2_submit(&ts->stream_id, cf, data, ctx->h2, req,
                            NULL, ts, tunnel_send_callback, cf);
@@ -963,35 +979,68 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
                                  struct tunnel_stream *ts)
 {
   CURLcode result = CURLE_OK;
+  struct dynhds_entry *capsule_protocol = NULL;
   struct dynhds_entry *auth_reply = NULL;
   (void)cf;
 
   DEBUGASSERT(ts->resp);
-  if(ts->resp->status/100 == 2) {
-    infof(data, "CONNECT tunnel established, response %d", ts->resp->status);
-    h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
-    return CURLE_OK;
+  if(cf->conn->bits.udp_tunnel_proxy) {
+    if(ts->resp->status == 200) {
+      infof(data, "MASQUE FIX: CONNECT-UDP Response --> 200 OK");
+      capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
+                                "capsule-protocol");
+      if(capsule_protocol) {
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
+                                        "Capsule-protocol: ?1");
+        if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
+          infof(data, "CONNECT-UDP tunnel established, response %d",
+                    ts->resp->status);
+          h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
+          return CURLE_OK;
+        }
+      }
+      else {
+        /* NOTE proxies may not set capsule protocol in the headers */
+        infof(data, "MASQUE FIX: CONNECT-UDP Response 200 OK, "
+                    "but no capsule-protocol header found");
+        h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
+        return CURLE_OK;
+      }
+    }
+    else {
+        infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d",
+            ts->resp->status);
+        h2_tunnel_go_state(cf, ts, H2_TUNNEL_FAILED, data);
+        return CURLE_RECV_ERROR;
+    }
   }
-
-  if(ts->resp->status == 401) {
-    auth_reply = Curl_dynhds_cget(&ts->resp->headers, "WWW-Authenticate");
-  }
-  else if(ts->resp->status == 407) {
-    auth_reply = Curl_dynhds_cget(&ts->resp->headers, "Proxy-Authenticate");
-  }
-
-  if(auth_reply) {
-    CURL_TRC_CF(data, cf, "[0] CONNECT: fwd auth header '%s'",
-                auth_reply->value);
-    result = Curl_http_input_auth(data, ts->resp->status == 407,
-                                  auth_reply->value);
-    if(result)
-      return result;
-    if(data->req.newurl) {
-      /* Indicator that we should try again */
-      Curl_safefree(data->req.newurl);
-      h2_tunnel_go_state(cf, ts, H2_TUNNEL_INIT, data);
+  else {
+    if(ts->resp->status/100 == 2) {
+      infof(data, "CONNECT tunnel established, response %d", ts->resp->status);
+      h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
       return CURLE_OK;
+    }
+
+    if(ts->resp->status == 401) {
+      auth_reply = Curl_dynhds_cget(&ts->resp->headers, "WWW-Authenticate");
+    }
+    else if(ts->resp->status == 407) {
+      auth_reply = Curl_dynhds_cget(&ts->resp->headers, "Proxy-Authenticate");
+    }
+
+    if(auth_reply) {
+      CURL_TRC_CF(data, cf, "[0] CONNECT: fwd auth header '%s'",
+                  auth_reply->value);
+      result = Curl_http_input_auth(data, ts->resp->status == 407,
+                                    auth_reply->value);
+      if(result)
+        return result;
+      if(data->req.newurl) {
+        /* Indicator that we should try again */
+        Curl_safefree(data->req.newurl);
+        h2_tunnel_go_state(cf, ts, H2_TUNNEL_INIT, data);
+        return CURLE_OK;
+      }
     }
   }
 
@@ -1252,6 +1301,32 @@ static void cf_h2_proxy_adjust_pollset(struct Curl_cfilter *cf,
   }
 }
 
+static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
+                                   struct Curl_easy *data,
+                                   char *buf, size_t len, CURLcode *err)
+{
+  struct cf_h2_proxy_ctx *ctx = cf->ctx;
+  ssize_t nread;
+  size_t consumed_before, consumed_after;
+
+  /* Track buffer consumption to calculate bytes consumed */
+  consumed_before = Curl_bufq_len(&ctx->tunnel.recvbuf);
+
+  nread = curl_capsule_process_udp(cf, data, &ctx->tunnel.recvbuf,
+                                   buf, len, err);
+
+  if(nread > 0) {
+    /* Calculate how many bytes were consumed from the buffer */
+    consumed_after = Curl_bufq_len(&ctx->tunnel.recvbuf);
+    size_t total_consumed = consumed_before - consumed_after;
+
+    /* Directly call nghttp2_session_consume once with total consumed bytes */
+    nghttp2_session_consume(ctx->h2, ctx->tunnel.stream_id, total_consumed);
+  }
+
+  return nread;
+}
+
 static CURLcode h2_handle_tunnel_close(struct Curl_cfilter *cf,
                                        struct Curl_easy *data,
                                        size_t *pnread)
@@ -1332,12 +1407,33 @@ static CURLcode cf_h2_proxy_recv(struct Curl_cfilter *cf,
       goto out;
   }
 
-  result = tunnel_recv(cf, data, buf, len, pnread);
+  if(data->conn->bits.udp_tunnel_proxy) {
+    if(Curl_bufq_is_empty(&ctx->tunnel.recvbuf)) {
+      result = CURLE_AGAIN;
+      goto out;
+    }
 
-  if(!result) {
-    CURL_TRC_CF(data, cf, "[%d] increase window by %zu",
-                ctx->tunnel.stream_id, *pnread);
-    nghttp2_session_consume(ctx->h2, ctx->tunnel.stream_id, *pnread);
+    pnread = process_udp_capsule(cf, data, buf, len, &result);
+    if(pnread == -1) {
+      if(ctx->tunnel.closed) {
+        result = h2_handle_tunnel_close(cf, data, pnread);
+      }
+      else if(ctx->tunnel.reset ||
+              (ctx->conn_closed && Curl_bufq_is_empty(&ctx->inbufq)) ||
+              (ctx->rcvd_goaway &&
+              ctx->last_stream_id < ctx->tunnel.stream_id)) {
+        result = CURLE_RECV_ERROR;
+      }
+    }
+  }
+  else {
+    result = tunnel_recv(cf, data, buf, len, pnread);
+
+    if(!result) {
+      CURL_TRC_CF(data, cf, "[%d] increase window by %zu",
+                  ctx->tunnel.stream_id, *pnread);
+      nghttp2_session_consume(ctx->h2, ctx->tunnel.stream_id, *pnread);
+    }
   }
 
   result = Curl_1st_fatal(result, proxy_h2_progress_egress(cf, data));
@@ -1379,7 +1475,22 @@ static CURLcode cf_h2_proxy_send(struct Curl_cfilter *cf,
     goto out;
   }
 
-  result = Curl_bufq_write(&ctx->tunnel.sendbuf, buf, len, pnwritten);
+  if(data->conn->bits.udp_tunnel_proxy) {
+    struct dynbuf dyn;
+
+    result = curl_capsule_encap_udp_datagram(&dyn, buf, len);
+    if(result)
+      goto out;
+
+    result = Curl_bufq_write(&ctx->tunnel.sendbuf,
+                            (const unsigned char *)curlx_dyn_ptr(&dyn),
+                            curlx_dyn_len(&dyn), pnwritten);
+    curlx_dyn_free(&dyn);
+  }
+  else {
+    result = Curl_bufq_write(&ctx->tunnel.sendbuf, buf, len, pnwritten);
+  }
+
   CURL_TRC_CF(data, cf, "cf_send(), bufq_write %d, %zd", result, *pnwritten);
   if(result && (result != CURLE_AGAIN))
     goto out;
