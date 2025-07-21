@@ -303,7 +303,8 @@ out:
   return result;
 }
 
-static CURLcode on_resp_header_udp(struct Curl_easy *data,
+static CURLcode on_resp_header_udp(struct Curl_cfilter *cf,
+                                   struct Curl_easy *data,
                                    struct h1_tunnel_state *ts,
                                    const char *header)
 {
@@ -314,7 +315,7 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     if(Curl_compareheader(header,
                            STRCONST("Transfer-Encoding:"),
                            STRCONST("chunked"))) {
-      infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
+      CURL_TRC_CF(data, cf, "CONNECT-UDP Response --> "
                   "Transfer-Encoding: chunked");
       ts->chunked_encoding = TRUE;
       /* reset our chunky engine */
@@ -325,13 +326,13 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     if(Curl_compareheader(header,
                            STRCONST("Capsule-protocol:"),
                            STRCONST("?1"))) {
-      infof(data, "MASQUE FIX: CONNECT-UDP Response --> Capsule-protocol: ?1");
+      CURL_TRC_CF(data, cf, "CONNECT-UDP Response --> Capsule-protocol: ?1");
     }
   }
   else if(Curl_compareheader(header,
                               STRCONST("Connection:"), STRCONST("close"))) {
     ts->close_connection = TRUE;
-    infof(data, "MASQUE FIX: CONNECT-UDP Response --> Connection: close");
+    CURL_TRC_CF(data, cf, "CONNECT-UDP Response --> Connection: close");
   }
   else if(!strncmp(header, "HTTP/1.", 7) &&
            ((header[7] == '0') || (header[7] == '1')) &&
@@ -341,7 +342,7 @@ static CURLcode on_resp_header_udp(struct Curl_easy *data,
     /* store the HTTP code from the proxy */
     data->info.httpproxycode = k->httpcode = (header[9] - '0') * 100 +
                           (header[10] - '0') * 10 + (header[11] - '0');
-    infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d", k->httpcode);
+    CURL_TRC_CF(data, cf, "CONNECT-UDP Response --> %d", k->httpcode);
   }
   return result;
 }
@@ -576,7 +577,7 @@ static CURLcode recv_CONNECT_resp(struct Curl_cfilter *cf,
     }
 
     if(cf->conn->bits.udp_tunnel_proxy) {
-      result = on_resp_header_udp(data, ts, linep);
+      result = on_resp_header_udp(cf, data, ts, linep);
     }
     else {
       result = on_resp_header(cf, data, ts, linep);
@@ -719,10 +720,10 @@ static CURLcode H1_CONNECT(struct Curl_cfilter *cf,
   /* 101 Switching Protocol for CONNECT-UDP */
   h1_tunnel_go_state(cf, ts, H1_TUNNEL_ESTABLISHED, data);
   if(cf->conn->bits.udp_tunnel_proxy)
-    infof(data, "CONNECT-UDP tunnel established, response %d",
+    CURL_TRC_CF(data, cf, "CONNECT-UDP tunnel established, response %d",
                                     data->info.httpproxycode);
   else
-    infof(data, "CONNECT tunnel established, response %d",
+    CURL_TRC_CF(data, cf, "CONNECT tunnel established, response %d",
                                     data->info.httpproxycode);
   result = CURLE_OK;
 

@@ -1011,14 +1011,11 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
   DEBUGASSERT(ts->resp);
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
-      infof(data, "MASQUE FIX: CONNECT-UDP Response --> 200 OK");
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
                                 "capsule-protocol");
       if(capsule_protocol) {
-        infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
-                                        "Capsule-protocol: ?1");
         if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
-          infof(data, "CONNECT-UDP tunnel established, response %d",
+          CURL_TRC_CF(data, cf, "CONNECT-UDP tunnel established, response %d",
                     ts->resp->status);
           h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
           return CURLE_OK;
@@ -1026,22 +1023,23 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
       }
       else {
         /* NOTE proxies may not set capsule protocol in the headers */
-        infof(data, "MASQUE FIX: CONNECT-UDP Response 200 OK, "
-                    "but no capsule-protocol header found");
+        CURL_TRC_CF(data, cf, "CONNECT-UDP tunnel established, response %d"
+                    "but no capsule-protocol header found", ts->resp->status);
         h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
         return CURLE_OK;
       }
     }
     else {
-        infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d",
-            ts->resp->status);
+        CURL_TRC_CF(data, cf, "Failed to establish CONNECT-UDP tunnel, "
+                "response %d", ts->resp->status);
         h2_tunnel_go_state(cf, ts, H2_TUNNEL_FAILED, data);
         return CURLE_RECV_ERROR;
     }
   }
   else {
     if(ts->resp->status/100 == 2) {
-      infof(data, "CONNECT tunnel established, response %d", ts->resp->status);
+      CURL_TRC_CF(data, cf, "CONNECT tunnel established, response %d",
+                  ts->resp->status);
       h2_tunnel_go_state(cf, ts, H2_TUNNEL_ESTABLISHED, data);
       return CURLE_OK;
     }

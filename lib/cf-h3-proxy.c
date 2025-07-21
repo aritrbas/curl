@@ -883,28 +883,18 @@ static int handle_buffered_data(struct cf_osslq_stream *s,
 
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, tmp_buf + head,
                                               data_len, &result);
-  infof(data, "[handle_buffered_data.......] "
-              "stream ID %zd, data_len=%d, head=%d, tail=%d",
-        s->id, data_len, head, tail);
 
-  if(nwritten < 0) {
-    infof(data, "[ABASU TEST] nwritten returned < 0 in handle_buffered_data");
-  }
-  else if(nwritten < data_len) {
+  if(nwritten < 0)
+    return 0;
+  if(nwritten < data_len) {
     head += nwritten;
     data_len = tail - head + 1;
-    infof(data, "[ABASU TEST] nwritten = %zd, data_len = %d, "
-                "head = %d, tail = %d",
-                nwritten, data_len, head, tail);
   }
   else {
     proxy_ctx->partial_read = FALSE;
     head = 0;
     tail = 0;
     memset(tmp_buf, 0, TMP_BUF_SIZE);
-    infof(data, "[ABASU TEST] nwritten = %zd, data_len = %d, "
-                "head = %d, tail = %d",
-                nwritten, data_len, head, tail);
   }
   return 0;
 }
@@ -933,9 +923,6 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   CURL_TRC_CF(data, cf, "[cb_h3_recv_data] "
               "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
               stream->s.id, buflen, stream->tun_data_recvd);
-  infof(data, "[cb_h3_recv_data] "
-              "[%" FMT_PRId64 "] DATA len=%zu, total=%zd",
-              stream->s.id, buflen, stream->tun_data_recvd);
 
   if(proxy_ctx->partial_read) {
     memcpy(tmp_buf + tail, buf, buflen);
@@ -944,18 +931,13 @@ static int cb_h3_recv_data(nghttp3_conn *conn, int64_t stream3_id,
   }
 
   nwritten = Curl_bufq_write(&proxy_ctx->inbufq, buf, buflen, &result);
-  infof(data, "[cb_h3_recv_data] inbufq data len = %u, "
-              "nwritten=%zd, buflen=%zu",
-              Curl_bufq_len(&proxy_ctx->inbufq), nwritten, buflen);
   if(nwritten < 0) {
-    infof(data, "[ABASU TEST] setting partial read to TRUE 1");
     proxy_ctx->partial_read = TRUE;
     memcpy(tmp_buf + tail, buf, buflen);
     tail += buflen;
     return 0;
   }
   else if(nwritten < buflen) {
-    infof(data, "[ABASU TEST] setting partial read to TRUE 2");
     proxy_ctx->partial_read = TRUE;
     memcpy(tmp_buf + tail, buf + nwritten, (buflen - nwritten));
     tail += (buflen - nwritten);
@@ -1165,8 +1147,6 @@ cb_h3_read_data_for_tunnel_stream(nghttp3_conn *conn, int64_t stream_id,
     DEBUGASSERT(nvecs > 0); /* we SHOULD have been be able to peek */
   }
 
-  infof(data, "nvecs = %d, nwritten %zu, sendbuf_len_in_flight = %zu",
-        (int)nvecs, nwritten, stream->sendbuf_len_in_flight);
   if(nwritten > 0 && stream->upload_left != -1)
     stream->upload_left -= nwritten;
 
@@ -1322,8 +1302,6 @@ static ssize_t h3_quic_recv(void *reader_ctx,
   size_t nread;
   int rv;
 
-  if(x->s->id == 0)
-    infof(x->data, "[h3_quic_recv] stream %ld", x->s->id);
   *err = CURLE_OK;
   rv = SSL_read_ex(x->s->ssl, buf, len, &nread);
   if(rv <= 0) {
@@ -1363,8 +1341,6 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
                                      struct Curl_cfilter *cf,
                                      struct Curl_easy *data)
 {
-  if(s->id == 0)
-    infof(data, "[cf_osslq_stream_recv] stream %ld", s->id);
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -1394,18 +1370,11 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         nread = Curl_bufq_sipn(&s->recvbuf, 0, h3_quic_recv, &x, &result);
         if(nread < 0) {
           if(result != CURLE_AGAIN) {
-            /* MASQUE FIX: Remove this later */
-            infof(data, "[cf_osslq_stream_recv] Stream %ld err result %zd",
-               s->id, result);
+
             goto out;
           }
           result = CURLE_OK;
           eagain = TRUE;
-        }
-        else {
-          /* MASQUE FIX: Remove this later */
-          infof(data, "[cf_osslq_stream_recv] Stream %ld read nread=%ld bytes",
-               s->id, nread);
         }
       }
     }
@@ -1461,18 +1430,11 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
         CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] stream %ld, received %zd "
                       "bytes, DATA bytes = %zu, forwarded to nghttp3 = %zd",
                       s->id, s->id, blen, (blen - nread), nread);
-        /* MASQUE FIX: Remove this later */
-        infof(data, "[cf_osslq_stream_recv] stream %ld, received %d "
-             "bytes, " "DATA bytes = %zu, forwarded to nghttp3 = %zd", s->id,
-             blen, (blen - nread), nread);
 
         Curl_bufq_skip(&s->recvbuf, blen);
         total_recv_len += blen;
 
         if(Curl_bufq_is_empty(&s->recvbuf) || proxy_ctx->partial_read) {
-          /* MASQUE FIX: Remove this later */
-          /* infof(data, "[cf_osslq_stream_recv] Clear recvbuf by %zu
-             bytes, " "all data in buffer processed", blen); */
           break;
         }
       }
@@ -1514,9 +1476,6 @@ static CURLcode cf_osslq_stream_recv(struct cf_osslq_stream *s,
     }
   }
 out:
-  if(result)
-    infof(data, "[%" FMT_PRId64 "] cf_osslq_stream_recv -> %d",
-                s->id, result);
   return result;
 }
 
@@ -1546,8 +1505,6 @@ static bool cf_osslq_iter_recv(unsigned int mid, void *val, void *user_data)
 static CURLcode proxy_h3_progress_ingress(struct Curl_cfilter *cf,
                                           struct Curl_easy *data)
 {
-  /* MASQUE FIX: Remove this later */
-  /* infof(data, "[proxy_h3_progress_ingress] ......."); */
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -1752,27 +1709,18 @@ static CURLcode h3_send_streams(struct Curl_cfilter *cf,
     DEBUGASSERT(s->id == stream_id);
     for(i = 0, total_len = 0; i < n; ++i) {
       total_len += vec[i].len;
-        /* if(vec[i].len == 3)
-        infof(data, "[cf_h3_proxy_send] len == 3, "); */
     }
 
-/*     infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC stream %d",
-           s->id, total_len, stream_id); */
     for(i = 0; (i < n) && !blocked; ++i) {
       /* Without stream->s.ssl, we closed that already, so
        * pretend the write did succeed. */
       uint64_t flags = (eos && ((i + 1) == n)) ? SSL_WRITE_FLAG_CONCLUDE : 0;
       if(stream_id == proxy_ctx->tunnel.stream_id) {
-        /* infof(data, "[h3_send_streams] not sending eos for tunnel"
-                    "stream %d", stream_id); */
         eos = 0;
       }
       written = vec[i].len;
       ok = !s->ssl || SSL_write_ex2(s->ssl, vec[i].base, vec[i].len, flags,
                                     &written);
-      infof(data, "[%" FMT_PRId64 "] send %zu bytes to QUIC, "
-                  "written %zu bytes, eos=%d ok=%zu",
-           s->id, vec[i].len, written, eos, ok);
       if(ok) {
         /* As OpenSSL buffers the data, we count this as acknowledged
          * from nghttp3's point of view */
@@ -1828,7 +1776,6 @@ static CURLcode h3_send_streams(struct Curl_cfilter *cf,
     if(eos && !s->send_blocked && !eos_written) {
       /* wrote everything and H3 indicates end of stream */
       CURL_TRC_CF(data, cf, "[%" FMT_PRId64 "] closing QUIC stream", s->id);
-      infof(data, "[%" FMT_PRId64 "] closing QUIC stream", s->id);
       SSL_stream_conclude(s->ssl, 0);
     }
   }
@@ -1841,8 +1788,6 @@ out:
 static CURLcode proxy_h3_progress_egress(struct Curl_cfilter *cf,
                                          struct Curl_easy *data)
 {
-  /* MASQUE FIX: Remove this later */
-  /* infof(data, "[proxy_h3_progress_egress] ......."); */
   struct cf_h3_proxy_ctx *proxy_ctx = cf->ctx;
   struct cf_osslq_ctx *ctx = proxy_ctx->osslq_ctx;
   CURLcode result = CURLE_OK;
@@ -1991,8 +1936,6 @@ static ssize_t cf_h3_proxy_send(struct Curl_cfilter *cf,
         goto out;
       }
 
-      if(len == 0)
-        infof(data, "[cf_h3_proxy_send] len == 0, ");
       nwritten = Curl_bufq_write(&stream->sendbuf,
                                  (const unsigned char *)curlx_dyn_ptr(&dyn),
                                  curlx_dyn_len(&dyn), err);
@@ -2055,7 +1998,6 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
   struct cf_call_data save;
   CURLcode result;
 
-  /* infof(data, "[cf_h3_proxy_recv] called, len=%zu", len); */
   if(proxy_ctx->tunnel.closed)
     return nread;
 
@@ -2077,9 +2019,6 @@ static ssize_t cf_h3_proxy_recv(struct Curl_cfilter *cf,
       nread = Curl_bufq_read(&proxy_ctx->inbufq,
                               (unsigned char *)buf, len, err);
       if(nread < 0) {
-        infof(data, "[%" FMT_PRId64 "] read recvbuf(len=%zu) "
-                                "-> %zd, %d",
-                        stream->s.id, len, nread, *err);
         goto out;
       }
     }
@@ -2234,14 +2173,8 @@ static void proxy_h3_submit(int32_t *pstream_id,
   }
 
   if(Curl_trc_is_verbose(data)) {
-    infof(data, "[H3-PROXY] [%" FMT_PRId64 "] OPENED stream for %s",
-          stream->s.id, data->state.url);
-    for(i = 0; i < nheader; ++i) {
-      infof(data, "[H3-PROXY] [%" FMT_PRId64 "] [%.*s: %.*s]",
-            stream->s.id,
-            (int)nva[i].namelen, nva[i].name,
-            (int)nva[i].valuelen, nva[i].value);
-    }
+    CURL_TRC_CF(data, cf, "[H3-PROXY] [%" FMT_PRId64 "] OPENED stream "
+                "for %s", stream->s.id, data->state.url);
   }
 
 out:
@@ -2566,37 +2499,35 @@ inspect_response(struct Curl_cfilter *cf,
   DEBUGASSERT(ts->resp);
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
-      infof(data, "MASQUE FIX: CONNECT-UDP Response --> 200 OK");
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,
                                           "capsule-protocol");
       if(capsule_protocol) {
-        infof(data, "MASQUE FIX: CONNECT-UDP Response --> "
-                                        "Capsule-protocol: ?1");
         if(strncmp(capsule_protocol->value, "?1", 2) == 0) {
-          infof(data, "CONNECT-UDP tunnel established, response %d",
-                    ts->resp->status);
+          CURL_TRC_CF(data, cf, "CONNECT-UDP tunnel established, ",
+                    "response %d", ts->resp->status);
           h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
           return CURLE_OK;
         }
       }
       else {
         /* NOTE proxies may not set capsule protocol in the headers */
-        infof(data, "MASQUE FIX: CONNECT-UDP Response 200 OK, "
-                    "but no capsule-protocol header found");
+        CURL_TRC_CF(data, cf, "CONNECT-UDP tunnel established, response %d"
+                    "but no capsule-protocol header found", ts->resp->status);
         h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
         return CURLE_OK;
       }
     }
     else {
-        infof(data, "MASQUE FIX: CONNECT-UDP Response --> %d",
-            ts->resp->status);
+        CURL_TRC_CF(data, cf, "Failed to establish CONNECT-UDP tunnel, "
+                "response %d", ts->resp->status);
         h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
         return CURLE_RECV_ERROR;
     }
   }
   else {
     if(ts->resp->status / 100 == 2) {
-      infof(data, "CONNECT tunnel established, response %d", ts->resp->status);
+      CURL_TRC_CF(data, cf, "CONNECT tunnel established, response %d",
+                  ts->resp->status);
       h3_tunnel_go_state(cf, ts, H3_TUNNEL_ESTABLISHED, data);
       return CURLE_OK;
     }
@@ -2742,11 +2673,11 @@ out:
       struct ip_quadruple ip;
 
       Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip);
-      infof(data, "QUIC connect to %s port %u failed: %s",
+      failf(data, "QUIC connect to %s port %u failed: %s",
             ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
     }
     else {
-      infof(data, "QUIC connect failed, issue with filter chain, "
+      failf(data, "QUIC connect failed, issue with filter chain, "
                   "could not find Curl_cft_udp filter");
     }
   }
@@ -2793,13 +2724,6 @@ static CURLcode H3_CONNECT(struct Curl_cfilter *cf,
         result = proxy_h3_progress_ingress(cf, data);
         if(result)
           goto out;
-        /*
-        result = proxy_h3_progress_ingress(cf, data);
-        if(result && result != CURLE_AGAIN) {
-          h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);
-          goto out;
-        }
-        */
         result = proxy_h3_progress_egress(cf, data);
         if(result && result != CURLE_AGAIN) {
           h3_tunnel_go_state(cf, ts, H3_TUNNEL_FAILED, data);

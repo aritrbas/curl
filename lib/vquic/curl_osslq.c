@@ -418,8 +418,6 @@ ossl_bio_masque_read(BIO *b, BIO_MSG *msg, size_t stride,
     return 0;
   }
   else if(nread == 0) {
-    /* MASQUE FIX: Is this case really needed?
-       If so, do we return 0 or 1? */
     *num_processed = 0;
     return 0;
   }
