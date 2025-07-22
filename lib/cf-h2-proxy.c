@@ -1006,9 +1006,24 @@ static CURLcode inspect_response(struct Curl_cfilter *cf,
   CURLcode result = CURLE_OK;
   struct dynhds_entry *capsule_protocol = NULL;
   struct dynhds_entry *auth_reply = NULL;
+  size_t i, header_count;
   (void)cf;
 
   DEBUGASSERT(ts->resp);
+
+  /* Log all response headers */
+  header_count = Curl_dynhds_count(&ts->resp->headers);
+  if(cf->conn->bits.udp_tunnel_proxy)
+    infof(data, "CONNECT-UDP Response Status %d", ts->resp->status);
+  else
+    infof(data, "CONNECT Response Status %d", ts->resp->status);
+  infof(data, "Response Headers (%zu total):", header_count);
+  for(i = 0; i < header_count; i++) {
+    struct dynhds_entry *entry = Curl_dynhds_getn(&ts->resp->headers, i);
+    if(entry)
+      infof(data, "  %s: %s", entry->name, entry->value);
+  }
+
   if(cf->conn->bits.udp_tunnel_proxy) {
     if(ts->resp->status == 200) {
       capsule_protocol = Curl_dynhds_cget(&ts->resp->headers,

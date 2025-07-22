@@ -249,8 +249,8 @@ ssize_t curl_capsule_process_udp_ex(struct Curl_cfilter *cf,
     /* Adjust length (subtract context ID length) */
     capsule_length--;
     if(Curl_bufq_len(recvbufq) < offset + capsule_length) {
-      infof(data, "Error! Not enough data for capsule length: %zu",
-            capsule_length);
+      infof(data, "Not enough data for capsule length: %zu",
+            "retry after reading more data", capsule_length);
       result = CURLE_OK;
       break;
     }
@@ -295,7 +295,7 @@ ssize_t curl_capsule_process_udp_ex(struct Curl_cfilter *cf,
     /* Move to the next message */
     idx++;
 
-    infof(data, "Processed UDP capsule: size=%zu length_left %zu",
+    CURL_TRC_CF(data, cf, "Processed UDP capsule: size=%zu length_left %zu",
           capsule_length, Curl_bufq_len(recvbufq));
   }
 
