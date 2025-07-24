@@ -833,8 +833,8 @@ static CURLcode
 cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                  const void *buf, size_t len, bool eos, size_t *pnwritten)
 {
-  *pnwritten = 0;
   CURLcode result = CURLE_SEND_ERROR;
+  *pnwritten = 0;
 
   if(!cf->next)
     return result;
@@ -877,8 +877,8 @@ cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
                  char *buf, size_t len, size_t *pnread)
 {
   struct h1_tunnel_state *ts = cf->ctx;
-  *pnread = 0;
   CURLcode result = CURLE_RECV_ERROR;
+  *pnread = 0;
 
   if(!cf->next)
     return result;

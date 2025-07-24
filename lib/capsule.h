@@ -60,8 +60,9 @@ uint64_t curl_capsule_ntohll(uint64_t value);
  * Encode a variable-length integer according to HTTP/3 spec
  * @param dyn   Dynamic buffer to write encoded varint to
  * @param value Value to encode (must be <= 0x3FFFFFFFFFFFFFFF)
+ * @return CURLE_OK on success, error code on failure
  */
-void curl_capsule_encode_varint(struct dynbuf *dyn, uint64_t value);
+CURLcode curl_capsule_encode_varint(struct dynbuf *dyn, uint64_t value);
 
 /**
  * Decode a variable-length integer according to HTTP/3 spec
@@ -99,7 +100,7 @@ typedef void (*curl_capsule_consume_cb)(void *userdata, int32_t stream_id,
  * @param err       Error code output
  * @return Number of messages processed, or -1 on error
  */
-ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
+size_t curl_capsule_process_udp(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  struct bufq *recvbufq,
                                  char *buf, size_t len, CURLcode *err);

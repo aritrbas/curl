@@ -368,6 +368,8 @@ ossl_bio_masque_write(BIO *bio, BIO_MSG *msg, size_t stride,
   CURLcode result = CURLE_SEND_ERROR;
   BIO_MSG *bm;
 
+  (void)flags;
+
   DEBUGASSERT(data);
 
   for(size_t i = 0; i < num_msg; ++i) {
@@ -392,6 +394,7 @@ ossl_bio_masque_read(BIO *b, BIO_MSG *msg, size_t stride,
   size_t nread;
   CURLcode result = CURLE_RECV_ERROR;
 
+  (void)flags;
   DEBUGASSERT(data);
 
   if(num_msg == 0) {
@@ -401,10 +404,8 @@ ossl_bio_masque_read(BIO *b, BIO_MSG *msg, size_t stride,
 
   result = Curl_conn_cf_recv(cf->next, data,
                             (char *)msg, stride, &nread);
-  if(nread >= 0) {
-    CURL_TRC_CF(data, cf, "ossl_bio_masque_read(dgrams read=%zu) err=%d",
-                nread, result);
-  }
+  CURL_TRC_CF(data, cf, "ossl_bio_masque_read(dgrams read=%zu) err=%d",
+              nread, result);
 
   BIO_clear_retry_flags(b);
 
@@ -1232,7 +1233,9 @@ static nghttp3_callbacks ngh3_callbacks = {
   NULL, /* end_stream */
   cb_h3_reset_stream,
   NULL, /* shutdown */
-  NULL /* recv_settings */
+  NULL, /* recv_settings */
+  NULL, /* recv_origin */
+  NULL  /* end_origin */
 };
 
 static CURLcode cf_osslq_h3conn_init(struct cf_osslq_ctx *ctx, SSL *conn,
@@ -1301,9 +1304,8 @@ static CURLcode cf_osslq_ctx_start(struct Curl_cfilter *cf,
   const struct Curl_sockaddr_ex *peer_addr = NULL;
   BIO *bio = NULL;
   BIO_ADDR *baddr = NULL;
-static const struct alpn_spec ALPN_SPEC_H3 = {
-  { "h3" }, 1
-};
+  struct Curl_sockaddr_ex addr_ex;
+  static const struct alpn_spec ALPN_SPEC_H3 = { { "h3" }, 1 };
 
   DEBUGASSERT(ctx->initialized);
 
@@ -1372,12 +1374,10 @@ static const struct alpn_spec ALPN_SPEC_H3 = {
     if(!bio)
       return CURLE_OUT_OF_MEMORY;
 
-    struct Curl_sockaddr_ex addr_ex = {
-      .family = AF_INET,
-      .protocol = IPPROTO_UDP,
-      .addrlen = ctx->addr->ai_addrlen,
-      ._sa_ex_u.addr = ctx->addr->ai_addr
-    };
+    addr_ex.family = AF_INET;
+    addr_ex.protocol = IPPROTO_UDP;
+    addr_ex.addrlen = ctx->addr->ai_addrlen;
+    addr_ex._sa_ex_u.addr = *ctx->addr->ai_addr;
 
     result = make_bio_addr(&baddr, &addr_ex);
     if(result) {

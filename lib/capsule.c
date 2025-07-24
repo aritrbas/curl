@@ -69,36 +69,38 @@ uint64_t curl_capsule_ntohll(uint64_t value)
   return dst.u64;
 }
 
-void curl_capsule_encode_varint(struct dynbuf *dyn, uint64_t value)
+CURLcode curl_capsule_encode_varint(struct dynbuf *dyn, uint64_t value)
 {
+  CURLcode result;
   DEBUGASSERT(value <= 0x3FFFFFFFFFFFFFFF);
 
   if(value <= 0x3F) {
     uint8_t encoded;
     encoded = (char)value;
-    curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
+    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
   }
   else if(value <= 0x3FFF) {
     /* Set bits 15-14 to "01", preserve lower 14 bits */
     uint16_t encoded;
     encoded = (uint16_t)value & 0x3FFF;
     encoded = ntohs(encoded | 0x4000);
-    curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
+    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
   }
   else if(value <= 0x3FFFFFFF) {
     /* Set bits 31-30 to "10", preserve lower 30 bits */
     uint32_t encoded;
     encoded = (uint32_t)value & 0x3FFFFFFF;
     encoded = ntohl(encoded | 0x80000000);
-    curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
+    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
   }
   else {
     /* Set bits 63-62 to "11", preserve lower 62 bits */
     uint64_t encoded;
     encoded = (uint64_t)value & 0x3FFFFFFFFFFFFFFF;
     encoded = curl_capsule_ntohll(encoded | 0xC000000000000000);
-    curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
+    result = curlx_dyn_addn(dyn, &encoded, sizeof(encoded));
   }
+  return result;
 }
 
 uint64_t curl_capsule_decode_varint(char **start)
@@ -118,7 +120,7 @@ uint64_t curl_capsule_decode_varint(char **start)
 
   /* remove length bits, encoded in the first two bits of the first byte */
   value = first_byte & 0x3F;
-  bytes_left = (1 << (first_byte >> 6)) - 1;
+  bytes_left = (uint8_t)((1 << (first_byte >> 6)) - 1);
 
   do {
     value = (value << 8) | (uint8_t)(*pos);
@@ -139,23 +141,17 @@ CURLcode curl_capsule_encap_udp_datagram(struct dynbuf *dyn,
   curlx_dyn_init(dyn, HTTP_CAPSULE_HEADER_MAX_SIZE + blen);
 
   result = curlx_dyn_addn(dyn, &cap_type, sizeof(cap_type));
-  if(result)
-    return result;
 
-  curl_capsule_encode_varint(dyn, blen + 1);
+  result = curl_capsule_encode_varint(dyn, blen + 1);
 
   result = curlx_dyn_addn(dyn, &ctx_id, sizeof(ctx_id));
-  if(result)
-    return result;
 
   result = curlx_dyn_addn(dyn, buf, blen);
-  if(result)
-    return result;
 
-  return CURLE_OK;
+  return result;
 }
 
-ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
+size_t curl_capsule_process_udp(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  struct bufq *recvbufq,
                                  char *buf, size_t len, CURLcode *err)
@@ -163,9 +159,10 @@ ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
   /* All variable declarations at the beginning */
   BIO_MSG *my_bio = (BIO_MSG *)buf;
   BIO_MSG *bio_msg = NULL;
-  uint8_t *context_id, *capsule_type;
-  unsigned char *capsule_data, *temp_buf;
-  char *decode_ptr;
+  const unsigned char *context_id, *capsule_type;
+  unsigned char *capsule_data;
+  const unsigned char *temp_buf;
+  const char *decode_ptr;
   size_t num_msg = 32; /* MASQUE FIX: How to get this value from OpenSSL */
   size_t stride = len;
   size_t read_size;
@@ -211,8 +208,8 @@ ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
       break;
 
     /* Determine varint length */
-    decode_ptr = (char *)temp_buf;
-    capsule_length = curl_capsule_decode_varint(&decode_ptr);
+    decode_ptr = (const char *)temp_buf;
+    capsule_length = curl_capsule_decode_varint((char **)&decode_ptr);
 
     if(capsule_length == HTTP_INVALID_VARINT) {
       infof(data, "Error! Invalid varint length encoding");
@@ -221,7 +218,7 @@ ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
     }
 
     /* Skip over the varint in the actual buffer */
-    offset += (decode_ptr - (char *)temp_buf);
+    offset += (decode_ptr - (const char *)temp_buf);
 
     /* Read context ID (should be 0 for UDP Proxying Payload) */
     if(!Curl_bufq_peek_at(recvbufq, offset, &context_id, &read_size))
@@ -239,7 +236,7 @@ ssize_t curl_capsule_process_udp(struct Curl_cfilter *cf,
     /* Adjust length (subtract context ID length) */
     capsule_length--;
     if(Curl_bufq_len(recvbufq) < offset + capsule_length) {
-      infof(data, "Not enough data for capsule length: %zu",
+      infof(data, "Not enough data for capsule length: %zu, "
             "retry after reading more data", capsule_length);
       result = CURLE_OK;
       break;

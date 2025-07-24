@@ -295,9 +295,8 @@ CURLcode vquic_flush(struct Curl_cfilter *cf, struct Curl_easy *data,
                 blen, gsolen, result, sent);
     }
     else {
-      Curl_conn_cf_send(cf->next, data, (const char *)buf, blen,
-                                                FALSE, &result);
-      sent = blen;
+      result = Curl_conn_cf_send(cf->next, data, (const char *)buf, blen,
+                                                FALSE, &sent);
     }
 
     if(result) {

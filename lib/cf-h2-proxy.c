@@ -1321,7 +1321,7 @@ static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
 {
   struct cf_h2_proxy_ctx *ctx = cf->ctx;
   ssize_t nread;
-  size_t consumed_before, consumed_after;
+  size_t consumed_before, consumed_after, total_consumed;
 
   /* Track buffer consumption to calculate bytes consumed */
   consumed_before = Curl_bufq_len(&ctx->tunnel.recvbuf);
@@ -1332,7 +1332,7 @@ static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
   if(nread > 0) {
     /* Calculate how many bytes were consumed from the buffer */
     consumed_after = Curl_bufq_len(&ctx->tunnel.recvbuf);
-    size_t total_consumed = consumed_before - consumed_after;
+    total_consumed = consumed_before - consumed_after;
 
     /* Directly call nghttp2_session_consume once with total consumed bytes */
     nghttp2_session_consume(ctx->h2, ctx->tunnel.stream_id, total_consumed);
@@ -1405,6 +1405,7 @@ static CURLcode cf_h2_proxy_recv(struct Curl_cfilter *cf,
 {
   struct cf_h2_proxy_ctx *ctx = cf->ctx;
   struct cf_call_data save;
+  ssize_t capsules_processed;
   CURLcode result;
 
   *pnread = 0;
@@ -1427,8 +1428,8 @@ static CURLcode cf_h2_proxy_recv(struct Curl_cfilter *cf,
       goto out;
     }
 
-    *pnread = process_udp_capsule(cf, data, buf, len, &result);
-    if(*pnread == -1) {
+    capsules_processed = process_udp_capsule(cf, data, buf, len, &result);
+    if(capsules_processed == -1) {
       if(ctx->tunnel.closed) {
         result = h2_handle_tunnel_close(cf, data, pnread);
       }
@@ -1438,6 +1439,9 @@ static CURLcode cf_h2_proxy_recv(struct Curl_cfilter *cf,
               ctx->last_stream_id < ctx->tunnel.stream_id)) {
         result = CURLE_RECV_ERROR;
       }
+    }
+    else {
+      *pnread = (size_t)capsules_processed;
     }
   }
   else {

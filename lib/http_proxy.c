@@ -520,7 +520,7 @@ connect_sub:
       break;
 #endif
     default:
-      infof(data, "Unsupported ALPN(%d) negotiated for %s", tunnel_type, alpn);
+      infof(data, "Unsupported ALPN(%d) negotiated for %s", alpn, tunnel_type);
       result = CURLE_COULDNT_CONNECT;
       goto out;
     }
