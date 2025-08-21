@@ -697,6 +697,11 @@ static CURLcode proxy_setopts(struct OperationConfig *config, CURL *curl)
 
   MY_SETOPT_STR(curl, CURLOPT_PROXYUSERPWD, config->proxyuserpwd);
   my_setopt_long(curl, CURLOPT_HTTPPROXYTUNNEL, config->proxytunnel);
+
+  /* new in libcurl 8.17.0 */
+  my_setopt_long(curl, CURLOPT_HTTPPROXYUDPTUNNEL, config->proxyudptunnel);
+
+  /* new in libcurl 7.52.0 */
   if(config->preproxy)
     MY_SETOPT_STR(curl, CURLOPT_PRE_PROXY, config->preproxy);
 
