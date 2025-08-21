@@ -605,6 +605,8 @@ class CurlClient:
             ]
             if proto == 'h2':
                 xargs.append('--proxy-http2')
+            elif proto == 'h3':
+                xargs.append('--proxy-http3')
         else:
             xargs = [
                 '--proxy', f'http://{proxy_name}:{self.env.proxy_port}/',

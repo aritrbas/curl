@@ -1746,7 +1746,8 @@ static CURLcode ftp_epsv_disable(struct Curl_easy *data,
 
   if(conn->bits.ipv6
 #ifndef CURL_DISABLE_PROXY
-     && !(conn->bits.tunnel_proxy || conn->bits.socksproxy)
+     && !(conn->bits.tunnel_proxy || conn->bits.udp_tunnel_proxy ||
+                                                 conn->bits.socksproxy)
 #endif
     ) {
     /* We cannot disable EPSV when doing IPv6, so this is instead a fail */
@@ -1782,9 +1783,9 @@ static CURLcode ftp_control_addr_dup(struct Curl_easy *data,
      the effective control connection address is the proxy address,
      not the ftp host. */
 #ifndef CURL_DISABLE_PROXY
-  if(conn->bits.tunnel_proxy || conn->bits.socksproxy)
+  if(conn->bits.tunnel_proxy || conn->bits.udp_tunnel_proxy ||
+                                                conn->bits.socksproxy)
     *newhostp = strdup(conn->host.name);
-  else
 #endif
   if(!Curl_conn_get_ip_info(data, conn, FIRSTSOCKET, &is_ipv6, &ipquad) &&
      *ipquad.remote_ip)
