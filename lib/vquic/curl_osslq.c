@@ -2042,9 +2042,9 @@ out:
     if(cf->next->cft == &Curl_cft_udp) {
       struct ip_quadruple ip;
 
-    if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
-      infof(data, "QUIC connect to %s port %u failed: %s",
-            ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
+      if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+        infof(data, "QUIC connect to %s port %u failed: %s",
+              ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
     }
   }
 #endif

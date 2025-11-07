@@ -1328,6 +1328,7 @@ static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
                                    struct Curl_easy *data,
                                    char *buf, size_t len, CURLcode *err)
 {
+#ifdef USE_OPENSSL_QUIC
   struct cf_h2_proxy_ctx *ctx = cf->ctx;
   ssize_t nread;
   size_t consumed_before, consumed_after, total_consumed;
@@ -1348,6 +1349,14 @@ static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
   }
 
   return nread;
+#elif defined(USE_NGTCP2)
+  infof(data, "UDP tunnel proxy not supported for HTTP/2");
+  return CURLE_UNSUPPORTED_PROTOCOL;
+#else
+  infof(data, "UDP tunnel proxy not supported for HTTP/2");
+  *err = CURLE_UNSUPPORTED_PROTOCOL;
+  return -1;
+#endif
 }
 
 static CURLcode h2_handle_tunnel_close(struct Curl_cfilter *cf,

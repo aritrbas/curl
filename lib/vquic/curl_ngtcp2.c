@@ -146,6 +146,7 @@ struct cf_ngtcp2_ctx {
                                         is accepted by peer */
   CURLcode tls_vrfy_result;          /* result of TLS peer verification */
   int qlogfd;
+  struct Curl_addrinfo *addr;        /* remote addr */
   BIT(initialized);
   BIT(tls_handshake_complete);       /* TLS handshake is done */
   BIT(use_earlydata);                /* Using 0RTT data */
@@ -494,7 +495,7 @@ static void quic_settings(struct cf_ngtcp2_ctx *ctx,
 static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
                                struct Curl_easy *data);
 
-static int cf_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
+static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
 {
   struct Curl_cfilter *cf = user_data;
   struct cf_ngtcp2_ctx *ctx = cf ? cf->ctx : NULL;
@@ -849,7 +850,7 @@ static ngtcp2_callbacks ng_callbacks = {
   ngtcp2_crypto_client_initial_cb,
   NULL, /* recv_client_initial */
   ngtcp2_crypto_recv_crypto_data_cb,
-  cf_ngtcp2_handshake_completed,
+  cb_ngtcp2_handshake_completed,
   NULL, /* recv_version_negotiation */
   ngtcp2_crypto_encrypt_cb,
   ngtcp2_crypto_decrypt_cb,
@@ -2519,30 +2520,41 @@ static CURLcode cf_connect_start(struct Curl_cfilter *cf,
   if(result)
     return result;
 
-  if(Curl_cf_socket_peek(cf->next, data, &ctx->q.sockfd, &sockaddr, NULL))
-    return CURLE_QUIC_CONNECT_ERROR;
-  ctx->q.local_addrlen = sizeof(ctx->q.local_addr);
-  rv = getsockname(ctx->q.sockfd, (struct sockaddr *)&ctx->q.local_addr,
-                   &ctx->q.local_addrlen);
-  if(rv == -1)
-    return CURLE_QUIC_CONNECT_ERROR;
+  if(cf->next->cft == &Curl_cft_udp) {
+    if(Curl_cf_socket_peek(cf->next, data, &ctx->q.sockfd, &sockaddr, NULL))
+      return CURLE_QUIC_CONNECT_ERROR;
+    ctx->q.local_addrlen = sizeof(ctx->q.local_addr);
+    rv = getsockname(ctx->q.sockfd, (struct sockaddr *)&ctx->q.local_addr,
+                    &ctx->q.local_addrlen);
+    if(rv == -1)
+      return CURLE_QUIC_CONNECT_ERROR;
 
-  ngtcp2_addr_init(&ctx->connected_path.local,
-                   (struct sockaddr *)&ctx->q.local_addr,
-                   ctx->q.local_addrlen);
-  ngtcp2_addr_init(&ctx->connected_path.remote,
-                   &sockaddr->curl_sa_addr, (socklen_t)sockaddr->addrlen);
+    ngtcp2_addr_init(&ctx->connected_path.local,
+                    (struct sockaddr *)&ctx->q.local_addr,
+                    ctx->q.local_addrlen);
+    ngtcp2_addr_init(&ctx->connected_path.remote,
+                    &sockaddr->curl_sa_addr, (socklen_t)sockaddr->addrlen);
 
-  rc = ngtcp2_conn_client_new(&ctx->qconn, &ctx->dcid, &ctx->scid,
-                              &ctx->connected_path,
-                              NGTCP2_PROTO_VER_V1, &ng_callbacks,
-                              &ctx->settings, &ctx->transport_params,
-                              Curl_ngtcp2_mem(), cf);
-  if(rc)
+    rc = ngtcp2_conn_client_new(&ctx->qconn, &ctx->dcid, &ctx->scid,
+                                &ctx->connected_path,
+                                NGTCP2_PROTO_VER_V1, &ng_callbacks,
+                                &ctx->settings, &ctx->transport_params,
+                                Curl_ngtcp2_mem(), cf);
+    if(rc)
+      return CURLE_QUIC_CONNECT_ERROR;
+
+    ctx->conn_ref.get_conn = get_conn;
+    ctx->conn_ref.user_data = cf;
+  }
+  else {
+    struct Curl_sockaddr_ex addr_ex;
+    addr_ex.family = AF_INET;
+    addr_ex.protocol = IPPROTO_UDP;
+    addr_ex.addrlen = ctx->addr->ai_addrlen;
+    memcpy(&addr_ex.addr.sa, ctx->addr->ai_addr, ctx->addr->ai_addrlen);
+    /* ABASU FIX */
     return CURLE_QUIC_CONNECT_ERROR;
-
-  ctx->conn_ref.get_conn = get_conn;
-  ctx->conn_ref.user_data = cf;
+  }
 
   result = Curl_vquic_tls_init(&ctx->tls, cf, data, &ctx->peer, &ALPN_SPEC_H3,
                                cf_ngtcp2_tls_ctx_setup, &ctx->tls,
@@ -2592,11 +2604,13 @@ static CURLcode cf_ngtcp2_connect(struct Curl_cfilter *cf,
     return CURLE_OK;
   }
 
-  /* Connect the UDP filter first */
-  if(!cf->next->connected) {
-    result = Curl_conn_cf_connect(cf->next, data, done);
-    if(result || !*done)
-      return result;
+  if(cf->next->cft == &Curl_cft_udp) {
+    /* Connect the UDP filter first */
+    if(!cf->next->connected) {
+      result = Curl_conn_cf_connect(cf->next, data, done);
+      if(result || !*done)
+        return result;
+    }
   }
 
   *done = FALSE;
@@ -2669,11 +2683,13 @@ out:
 
 #ifndef CURL_DISABLE_VERBOSE_STRINGS
   if(result) {
-    struct ip_quadruple ip;
+    if(cf->next->cft == &Curl_cft_udp) {
+      struct ip_quadruple ip;
 
-    if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
-      infof(data, "QUIC connect to %s port %u failed: %s",
-            ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
+      if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+        infof(data, "QUIC connect to %s port %u failed: %s",
+              ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
+    }
   }
 #endif
   if(!result && ctx->qconn) {
@@ -2864,6 +2880,48 @@ out:
       Curl_conn_cf_discard_chain(&cf, data);
     else if(ctx)
       cf_ngtcp2_ctx_free(ctx);
+  }
+  return result;
+}
+
+static struct Curl_addrinfo *
+addr_first_match(struct Curl_addrinfo *addr, int family)
+{
+  while(addr) {
+    if(addr->ai_family == family)
+      return addr;
+    addr = addr->ai_next;
+  }
+  return NULL;
+}
+
+CURLcode Curl_cf_ngtcp2_insert_after(struct Curl_cfilter *cf_at,
+  struct Curl_easy *data, struct Curl_dns_entry *remotehost)
+{
+  struct cf_ngtcp2_ctx *ctx = NULL;
+  struct Curl_cfilter *cf = NULL;
+  struct Curl_addrinfo *addr;
+  CURLcode result;
+
+  (void)data;
+  ctx = calloc(1, sizeof(*ctx));
+  if(!ctx) {
+    result = CURLE_OUT_OF_MEMORY;
+    goto out;
+  }
+  cf_ngtcp2_ctx_init(ctx);
+  addr = addr_first_match(remotehost->addr, AF_INET);
+  ctx->addr = addr;
+
+  result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
+  if(result)
+    goto out;
+  Curl_conn_cf_insert_after(cf_at, cf);
+  cf->conn = cf_at->conn;
+out:
+  if(result) {
+    Curl_safefree(cf);
+    cf_ngtcp2_ctx_free(ctx);
   }
   return result;
 }

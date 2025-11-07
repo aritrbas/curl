@@ -691,8 +691,12 @@ CURLcode Curl_cf_quic_insert_after(struct Curl_cfilter *cf_at,
                                    struct Curl_easy *data,
                                    struct Curl_dns_entry *remotehost)
 {
-#if defined(USE_OPENSSL_QUIC) && defined(USE_NGHTTP3)
+#if defined(USE_NGTCP2) && defined(USE_NGHTTP3)
+  return Curl_cf_ngtcp2_insert_after(cf_at, data, remotehost);
+#elif defined(USE_OPENSSL_QUIC) && defined(USE_NGHTTP3)
   return Curl_cf_osslq_insert_after(cf_at, data, remotehost);
+#else
+  return CURLE_NOT_BUILT_IN;
 #endif
 }
 

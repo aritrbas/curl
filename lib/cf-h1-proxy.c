@@ -899,9 +899,17 @@ cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
     }
 
     /* Now process capsules from recvbuf into BIO_MSG format */
+#ifdef USE_OPENSSL_QUIC
     *pnread = Curl_capsule_process_udp(cf, data, &ts->recvbuf,
                                        buf, len, &result);
     return result;
+#elif defined(USE_NGTCP2)
+    infof(data, "UDP tunnel proxy not supported for HTTP/1.1");
+    return CURLE_UNSUPPORTED_PROTOCOL;
+#else
+    infof(data, "UDP tunnel proxy not supported for HTTP/1.1");
+    return CURLE_UNSUPPORTED_PROTOCOL;
+#endif
   }
   else {
     return cf->next->cft->do_recv(cf->next, data, buf, len, pnread);

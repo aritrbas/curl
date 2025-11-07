@@ -27,7 +27,7 @@
 #include "curl_setup.h"
 
 #if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP) && \
-    defined(USE_NGHTTP3) && defined(USE_OPENSSL_QUIC)
+    defined(USE_NGHTTP3) && (defined(USE_OPENSSL_QUIC) || defined(USE_NGTCP2))
 
 #include <openssl/bio.h>
 #include "curlx/dynbuf.h"
@@ -78,6 +78,6 @@ size_t Curl_capsule_process_udp(struct Curl_cfilter *cf,
                                  char *buf, size_t len, CURLcode *err);
 
 #endif /* !CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP &&
-                USE_NGHTTP3 && USE_OPENSSL_QUIC */
+                USE_NGHTTP3 && (USE_OPENSSL_QUIC || USE_NGTCP2) */
 
 #endif /* HEADER_CURL_CAPSULE_H */

@@ -1546,7 +1546,7 @@ struct UserDefined {
   BIT(get_filetime);     /* get the time and get of the remote file */
 #ifndef CURL_DISABLE_PROXY
   BIT(tunnel_thru_httpproxy); /* use CONNECT through an HTTP proxy */
-  BIT(tunnel_thru_httpproxy_udp); /* use CONNECT through an HTTP proxy */
+  BIT(tunnel_thru_httpproxy_udp); /* use CONNECT-UDP through an HTTP proxy */
 #endif
   BIT(prefer_ascii);     /* ASCII rather than binary */
   BIT(remote_append);    /* append, not overwrite, on upload */

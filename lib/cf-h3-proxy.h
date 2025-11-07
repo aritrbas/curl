@@ -26,13 +26,15 @@
 
 #include "curl_setup.h"
 
-#if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY)
+#if defined(USE_NGHTTP3) && !defined(CURL_DISABLE_PROXY) && \
+    (defined(USE_OPENSSL_QUIC) || defined(USE_NGTCP2))
 
 CURLcode Curl_cf_h3_proxy_insert_after(struct Curl_cfilter **pcf,
                                        struct Curl_easy *data);
 
 extern struct Curl_cftype Curl_cft_h3_proxy;
 
-#endif /* USE_NGHTTP3 && !CURL_DISABLE_PROXY */
+#endif /* USE_NGHTTP3 && !CURL_DISABLE_PROXY && \
+         (USE_OPENSSL_QUIC || USE_NGTCP2) */
 
 #endif /* HEADER_CURL_H3_PROXY_H */
