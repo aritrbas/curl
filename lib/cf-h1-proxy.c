@@ -872,6 +872,7 @@ cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                  const uint8_t *buf, size_t len, bool eos, size_t *pnwritten)
 {
   CURLcode result = CURLE_SEND_ERROR;
+  size_t nwritten = 0;
   *pnwritten = 0;
 
   if(!cf->next)
@@ -886,7 +887,8 @@ cf_h1_proxy_send(struct Curl_cfilter *cf, struct Curl_easy *data,
 
     result = cf->next->cft->do_send(cf->next, data,
                                     (const uint8_t *)curlx_dyn_ptr(&dyn),
-                                    curlx_dyn_len(&dyn), eos, pnwritten);
+                                    curlx_dyn_len(&dyn), eos, &nwritten);
+    *pnwritten = Curl_capsule_udp_payload_written(len, nwritten);
     curlx_dyn_free(&dyn);
   }
   else {
@@ -937,9 +939,17 @@ cf_h1_proxy_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
       }
     }
 
-    /* Now process capsules from recvbuf into BIO_MSG format */
+    /* Decapsulate UDP payload from HTTP DATAGRAM capsules. */
+#ifdef USE_NGTCP2
+    *pnread = Curl_capsule_process_udp_raw(cf, data, &ts->recvbuf,
+                                           (unsigned char *)buf, len, &result);
+#elif defined(USE_OPENSSL_QUIC)
     *pnread = Curl_capsule_process_udp(cf, data, &ts->recvbuf,
                                        buf, len, &result);
+#else
+    infof(data, "UDP tunnel proxy not supported for HTTP/1.1");
+    return CURLE_UNSUPPORTED_PROTOCOL;
+#endif
     return result;
   }
   else {

@@ -27,7 +27,7 @@
 #include "curl_setup.h"
 
 #if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP) && \
-    defined(USE_NGHTTP3) && defined(USE_OPENSSL_QUIC)
+    defined(USE_NGHTTP3) && (defined(USE_OPENSSL_QUIC) || defined(USE_NGTCP2))
 
 #include <openssl/bio.h>
 #include "curlx/dynbuf.h"
@@ -77,7 +77,31 @@ size_t Curl_capsule_process_udp(struct Curl_cfilter *cf,
                                  struct bufq *recvbufq,
                                  char *buf, size_t len, CURLcode *err);
 
+/**
+ * Process one UDP capsule from buffer into raw datagram payload bytes.
+ * @param cf        Connection filter
+ * @param data      Easy handle
+ * @param recvbufq  Buffer queue containing capsule data
+ * @param buf       Output buffer for one datagram payload
+ * @param len       Size of output buffer in bytes
+ * @param err       Error code output
+ * @return Number of payload bytes written. Check `err` for status.
+ */
+size_t Curl_capsule_process_udp_raw(struct Curl_cfilter *cf,
+                                    struct Curl_easy *data,
+                                    struct bufq *recvbufq,
+                                    unsigned char *buf, size_t len,
+                                    CURLcode *err);
+
+/**
+ * Map written capsule bytes back to written UDP payload bytes.
+ * `capsule_bytes` is the amount written from a buffer produced by
+ * `Curl_capsule_encap_udp_datagram()` with the same `payload_len`.
+ */
+size_t Curl_capsule_udp_payload_written(size_t payload_len,
+                                        size_t capsule_bytes);
+
 #endif /* !CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP &&
-                USE_NGHTTP3 && USE_OPENSSL_QUIC */
+                USE_NGHTTP3 && (USE_OPENSSL_QUIC || USE_NGTCP2) */
 
 #endif /* HEADER_CURL_CAPSULE_H */

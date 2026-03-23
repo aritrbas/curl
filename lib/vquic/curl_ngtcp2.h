@@ -54,6 +54,13 @@ CURLcode Curl_cf_ngtcp2_create(struct Curl_cfilter **pcf,
                                struct Curl_easy *data,
                                struct connectdata *conn,
                                const struct Curl_addrinfo *ai);
+
+CURLcode Curl_cf_ngtcp2_insert_after(struct Curl_cfilter *cf_at,
+                                     struct Curl_easy *data,
+                                     struct Curl_dns_entry *remotehost);
+bool Curl_conn_is_ngtcp2(const struct Curl_easy *data,
+                         const struct connectdata *conn,
+                         int sockindex);
 #endif
 
 #endif /* HEADER_CURL_VQUIC_CURL_NGTCP2_H */

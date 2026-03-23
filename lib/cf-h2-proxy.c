@@ -213,6 +213,37 @@ static void cf_h2_proxy_ctx_free(struct cf_h2_proxy_ctx *ctx)
   }
 }
 
+static size_t bufq_spare_count(const struct bufq *q)
+{
+  const struct buf_chunk *chunk = q->spare;
+  size_t n = 0;
+
+  while(chunk) {
+    ++n;
+    chunk = chunk->next;
+  }
+  return n;
+}
+
+static size_t bufq_writable_bytes(const struct bufq *q)
+{
+  size_t space = 0;
+  size_t spare_count;
+
+  if(q->opts & BUFQ_OPT_SOFT_LIMIT)
+    return (size_t)-1;
+
+  if(q->tail)
+    space += (q->tail->dlen - q->tail->w_offset);
+
+  spare_count = bufq_spare_count(q);
+  space += spare_count * q->chunk_size;
+  if(q->chunk_count < q->max_chunks)
+    space += (q->max_chunks - q->chunk_count) * q->chunk_size;
+
+  return space;
+}
+
 static void drain_tunnel(struct Curl_cfilter *cf,
                          struct Curl_easy *data,
                          struct tunnel_stream *tunnel)
@@ -1290,8 +1321,19 @@ static ssize_t process_udp_capsule(struct Curl_cfilter *cf,
   /* Track buffer consumption to calculate bytes consumed */
   consumed_before = Curl_bufq_len(&ctx->tunnel.recvbuf);
 
-  nread = Curl_capsule_process_udp(cf, data, &ctx->tunnel.recvbuf,
-                                   buf, len, err);
+#ifdef USE_NGTCP2
+  nread = (ssize_t)Curl_capsule_process_udp_raw(cf, data,
+                                                &ctx->tunnel.recvbuf,
+                                                (unsigned char *)buf,
+                                                len, err);
+#elif defined(USE_OPENSSL_QUIC)
+  nread = (ssize_t)Curl_capsule_process_udp(cf, data, &ctx->tunnel.recvbuf,
+                                            buf, len, err);
+#else
+  infof(data, "UDP tunnel proxy not supported for HTTP/2");
+  *err = CURLE_UNSUPPORTED_PROTOCOL;
+  return -1;
+#endif
 
   if(nread > 0) {
     /* Calculate how many bytes were consumed from the buffer */
@@ -1459,14 +1501,24 @@ static CURLcode cf_h2_proxy_send(struct Curl_cfilter *cf,
 
   if(data->conn->bits.udp_tunnel_proxy) {
     struct dynbuf dyn;
+    size_t capsule_len;
+    size_t capsule_written = 0;
 
     result = Curl_capsule_encap_udp_datagram(&dyn, buf, len);
     if(result)
       goto out;
 
+    capsule_len = curlx_dyn_len(&dyn);
+    if(bufq_writable_bytes(&ctx->tunnel.sendbuf) < capsule_len) {
+      curlx_dyn_free(&dyn);
+      result = CURLE_AGAIN;
+      goto out;
+    }
+
     result = Curl_bufq_write(&ctx->tunnel.sendbuf,
                             (const unsigned char *)curlx_dyn_ptr(&dyn),
-                            curlx_dyn_len(&dyn), pnwritten);
+                            capsule_len, &capsule_written);
+    *pnwritten = Curl_capsule_udp_payload_written(len, capsule_written);
     curlx_dyn_free(&dyn);
   }
   else {

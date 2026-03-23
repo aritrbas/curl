@@ -299,6 +299,11 @@ CURLcode vquic_flush(struct Curl_cfilter *cf, struct Curl_easy *data,
   CURLcode result;
   size_t gsolen;
 
+  if(!cf->next) {
+    CURL_TRC_CF(data, cf, "vquic_flush called without lower filter");
+    return CURLE_SEND_ERROR;
+  }
+
   while(Curl_bufq_peek(&qctx->sendbuf, &buf, &blen)) {
     gsolen = qctx->gsolen;
     if(qctx->split_len) {
@@ -311,8 +316,7 @@ CURLcode vquic_flush(struct Curl_cfilter *cf, struct Curl_easy *data,
       result = vquic_send_packets(cf, data, qctx, buf, blen, gsolen, &sent);
     }
     else {
-      result = Curl_conn_cf_send(cf->next, data, (const char *)buf, blen,
-                                                  FALSE, &sent);
+      result = Curl_conn_cf_send(cf->next, data, buf, blen, FALSE, &sent);
     }
 
     if(result) {
@@ -704,8 +708,12 @@ CURLcode Curl_cf_quic_insert_after(struct Curl_cfilter *cf_at,
                                    struct Curl_easy *data,
                                    struct Curl_dns_entry *remotehost)
 {
-#if defined(USE_OPENSSL_QUIC) && defined(USE_NGHTTP3)
+#if defined(USE_NGTCP2) && defined(USE_NGHTTP3)
+  return Curl_cf_ngtcp2_insert_after(cf_at, data, remotehost);
+#elif defined(USE_OPENSSL_QUIC) && defined(USE_NGHTTP3)
   return Curl_cf_osslq_insert_after(cf_at, data, remotehost);
+#else
+  return CURLE_NOT_BUILT_IN;
 #endif
 }
 

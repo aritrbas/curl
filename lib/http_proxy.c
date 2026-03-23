@@ -457,7 +457,6 @@ connect_sub:
 
     if(alpn && !strcmp(alpn, "http/1.0")) {
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/1.0");
-      infof(data, "installing subfilter for HTTP/1.0");
       result = Curl_cf_h1_proxy_insert_after(cf, data);
       if(result)
         goto out;
@@ -465,7 +464,6 @@ connect_sub:
     }
     else if(!alpn || !strcmp(alpn, "http/1.1")) {
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/1.1");
-      infof(data, "installing subfilter for HTTP/1.1");
       result = Curl_cf_h1_proxy_insert_after(cf, data);
       if(result)
         goto out;
@@ -475,7 +473,6 @@ connect_sub:
 #ifdef USE_NGHTTP2
     else if(!strcmp(alpn, "h2")) {
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/2");
-      infof(data, "installing subfilter for HTTP/2");
       result = Curl_cf_h2_proxy_insert_after(cf, data);
       if(result)
         goto out;
@@ -485,7 +482,6 @@ connect_sub:
 #ifdef USE_NGHTTP3
     else if(!strcmp(alpn, "h3")) {
       CURL_TRC_CF(data, cf, "installing subfilter for HTTP/3");
-      infof(data, "installing subfilter for HTTP/3");
       result = Curl_cf_h3_proxy_insert_after(&cf, data);
       if(result)
         goto out;

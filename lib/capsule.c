@@ -25,7 +25,7 @@
 #include "curl_setup.h"
 
 #if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP) && \
-    defined(USE_NGHTTP3) && defined(USE_OPENSSL_QUIC)
+    defined(USE_NGHTTP3) && (defined(USE_OPENSSL_QUIC) || defined(USE_NGTCP2))
 
 #include <openssl/bio.h>
 #include <curl/curl.h>
@@ -53,6 +53,17 @@ static uint64_t capsule_ntohll(uint64_t value)
   dst.u32[1] = ntohl(src.u32[0]);
 
   return dst.u64;
+}
+
+static size_t capsule_varint_len(uint64_t value)
+{
+  if(value <= 0x3F)
+    return 1;
+  else if(value <= 0x3FFF)
+    return 2;
+  else if(value <= 0x3FFFFFFF)
+    return 4;
+  return 8;
 }
 
 /**
@@ -162,6 +173,26 @@ CURLcode Curl_capsule_encap_udp_datagram(struct dynbuf *dyn,
   result = curlx_dyn_addn(dyn, buf, blen);
 
   return result;
+}
+
+size_t Curl_capsule_udp_payload_written(size_t payload_len,
+                                        size_t capsule_bytes)
+{
+  uint64_t capsule_len;
+  size_t hdr_len = 2; /* capsule type + context ID */
+
+  if(payload_len >= 0x3FFFFFFFFFFFFFFFULL)
+    capsule_len = 0x3FFFFFFFFFFFFFFFULL;
+  else
+    capsule_len = (uint64_t)payload_len + 1;
+  hdr_len += capsule_varint_len(capsule_len);
+
+  if(capsule_bytes <= hdr_len)
+    return 0;
+  capsule_bytes -= hdr_len;
+  if(capsule_bytes > payload_len)
+    capsule_bytes = payload_len;
+  return capsule_bytes;
 }
 
 size_t Curl_capsule_process_udp(struct Curl_cfilter *cf,
@@ -328,5 +359,98 @@ size_t Curl_capsule_process_udp(struct Curl_cfilter *cf,
   return (idx ? idx : 0);
 }
 
+size_t Curl_capsule_process_udp_raw(struct Curl_cfilter *cf,
+                                    struct Curl_easy *data,
+                                    struct bufq *recvbufq,
+                                    unsigned char *buf, size_t len,
+                                    CURLcode *err)
+{
+  const unsigned char *context_id, *capsule_type;
+  size_t read_size, varint_len;
+  size_t offset, capsule_length, payload_len;
+  size_t bytes_read = 0;
+  CURLcode result = CURLE_OK;
+
+  if(!len) {
+    *err = CURLE_BAD_FUNCTION_ARGUMENT;
+    return 0;
+  }
+
+  if(Curl_bufq_is_empty(recvbufq)) {
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+
+  if(!Curl_bufq_peek(recvbufq, &capsule_type, &read_size) || !read_size) {
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+
+  if(capsule_type[0]) {
+    infof(data, "Error! Invalid capsule type: %d", capsule_type[0]);
+    *err = CURLE_RECV_ERROR;
+    return 0;
+  }
+
+  offset = 1;
+  result = capsule_decode_varint_at(recvbufq, offset, &capsule_length,
+                                    &varint_len);
+  if(result == CURLE_AGAIN) {
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+  else if(result) {
+    *err = CURLE_RECV_ERROR;
+    return 0;
+  }
+  offset += varint_len;
+
+  if(!Curl_bufq_peek_at(recvbufq, offset, &context_id, &read_size) ||
+     !read_size) {
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+
+  if(*context_id) {
+    infof(data, "Error! Invalid context ID: %02x", *context_id);
+    *err = CURLE_RECV_ERROR;
+    return 0;
+  }
+  offset += 1;
+
+  if(!capsule_length) {
+    infof(data, "Error! Invalid capsule length: 0");
+    *err = CURLE_RECV_ERROR;
+    return 0;
+  }
+  payload_len = capsule_length - 1;
+
+  if(Curl_bufq_len(recvbufq) < offset + payload_len) {
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+
+  if(payload_len > len) {
+    infof(data, "UDP payload does not fit destination buffer: %zu > %zu",
+          payload_len, len);
+    *err = CURLE_AGAIN;
+    return 0;
+  }
+
+  Curl_bufq_skip(recvbufq, offset);
+  result = Curl_bufq_read(recvbufq, buf, payload_len, &bytes_read);
+  if(result || (bytes_read != payload_len)) {
+    infof(data, "Error! Read less than expected %zu %zu",
+          payload_len, bytes_read);
+    *err = CURLE_RECV_ERROR;
+    return 0;
+  }
+
+  CURL_TRC_CF(data, cf, "Processed UDP capsule raw: size=%zu length_left %zu",
+              payload_len, Curl_bufq_len(recvbufq));
+  *err = CURLE_OK;
+  return bytes_read;
+}
+
 #endif /* !CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP &&
-                USE_NGHTTP3 && USE_OPENSSL_QUIC */
+                USE_NGHTTP3 && (USE_OPENSSL_QUIC || USE_NGTCP2) */
