@@ -261,6 +261,41 @@ out:
   return result;
 }
 
+/* Split QUIC payload by datagram (gso) boundaries when sending over a
+ * non-UDP lower filter (for example CONNECT-UDP proxy tunnel). */
+static CURLcode send_packet_no_gso_cf(struct Curl_cfilter *cf,
+                                      struct Curl_easy *data,
+                                      const uint8_t *pkt, size_t pktlen,
+                                      size_t gsolen, size_t *psent)
+{
+  const uint8_t *p, *end = pkt + pktlen;
+  size_t sent, len;
+  CURLcode result = CURLE_OK;
+  VERBOSE(size_t calls = 0);
+
+  *psent = 0;
+
+  for(p = pkt; p < end; p += len) {
+    len = CURLMIN(gsolen, (size_t)(end - p));
+    result = Curl_conn_cf_send(cf->next, data, p, len, FALSE, &sent);
+    *psent += sent;
+    VERBOSE(++calls);
+    if(result)
+      goto out;
+    if(sent < len) {
+      /* Lower filter accepted only a partial amount, treat as blocked. */
+      result = CURLE_AGAIN;
+      goto out;
+    }
+  }
+
+out:
+  CURL_TRC_CF(data, cf, "vquic_cf_send(len=%zu, gso=%zu, calls=%zu)"
+              " -> %d, sent=%zu",
+              pktlen, gsolen, calls, result, *psent);
+  return result;
+}
+
 static CURLcode vquic_send_packets(struct Curl_cfilter *cf,
                                    struct Curl_easy *data,
                                    struct cf_quic_ctx *qctx,
@@ -302,6 +337,11 @@ CURLcode vquic_flush(struct Curl_cfilter *cf, struct Curl_easy *data,
   CURLcode result;
   size_t gsolen;
 
+  if(!cf->next) {
+    CURL_TRC_CF(data, cf, "vquic_flush called without lower filter");
+    return CURLE_SEND_ERROR;
+  }
+
   while(Curl_bufq_peek(&qctx->sendbuf, &buf, &blen)) {
     gsolen = qctx->gsolen;
     if(qctx->split_len) {
@@ -310,7 +350,17 @@ CURLcode vquic_flush(struct Curl_cfilter *cf, struct Curl_easy *data,
         blen = qctx->split_len;
     }
 
-    result = vquic_send_packets(cf, data, qctx, buf, blen, gsolen, &sent);
+    if(cf->next->cft == &Curl_cft_udp) {
+      result = vquic_send_packets(cf, data, qctx, buf, blen, gsolen, &sent);
+    }
+    else if(cf->conn && cf->conn->bits.udp_tunnel_proxy &&
+            gsolen && (blen > gsolen)) {
+      result = send_packet_no_gso_cf(cf, data, buf, blen, gsolen, &sent);
+    }
+    else {
+      result = Curl_conn_cf_send(cf->next, data, buf, blen, FALSE, &sent);
+    }
+
     if(result) {
       if(result == CURLE_AGAIN) {
         Curl_bufq_skip(&qctx->sendbuf, sent);
@@ -411,6 +461,7 @@ static CURLcode recvmmsg_packets(struct Curl_cfilter *cf,
                                           &sockbuf);
   if(result)
     goto out;
+
   bufs = (uint8_t (*)[MSG_BUF_SIZE])sockbuf;
 
   total_nread = 0;
@@ -699,6 +750,20 @@ CURLcode Curl_qlogdir(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+CURLcode Curl_cf_quic_insert_after(struct Curl_cfilter *cf_at,
+                                   struct Curl_easy *data,
+                                   struct Curl_dns_entry *remotehost)
+{
+#if defined(USE_NGTCP2) && defined(USE_NGHTTP3)
+  return Curl_cf_ngtcp2_insert_after(cf_at, data, remotehost);
+#else
+  (void)cf_at;
+  (void)data;
+  (void)remotehost;
+  return CURLE_NOT_BUILT_IN;
+#endif
+}
+
 CURLcode Curl_cf_quic_create(struct Curl_cfilter **pcf,
                              struct Curl_easy *data,
                              struct connectdata *conn,
@@ -735,10 +800,6 @@ CURLcode Curl_conn_may_http3(struct Curl_easy *data,
 #ifndef CURL_DISABLE_PROXY
   if(conn->bits.socksproxy) {
     failf(data, "HTTP/3 is not supported over a SOCKS proxy");
-    return CURLE_URL_MALFORMAT;
-  }
-  if(conn->bits.httpproxy && conn->bits.tunnel_proxy) {
-    failf(data, "HTTP/3 is not supported over an HTTP proxy");
     return CURLE_URL_MALFORMAT;
   }
 #endif

@@ -65,6 +65,7 @@
 #include "multiif.h"
 #include "curlx/inet_pton.h"
 #include "progress.h"
+#include "http_proxy.h"
 #include "conncache.h"
 #include "multihandle.h"
 #include "rand.h"
